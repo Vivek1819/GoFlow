@@ -1,10 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"time"
 
@@ -21,10 +22,10 @@ type Job struct {
 
 var db *sql.DB
 
-// -------------------- WORKER --------------------
+// ==================== WORKER ====================
 
 func startWorker() {
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -33,6 +34,7 @@ func startWorker() {
 		for {
 			var id int
 
+			// Claim one job atomically
 			err := db.QueryRow(`
 				UPDATE jobs
 				SET status = 'processing',
@@ -54,17 +56,37 @@ func startWorker() {
 			}
 
 			if err != nil {
-				log.Println("Failed to claim job:", err)
+				log.Println("Claim error:", err)
 				break
 			}
 
-			log.Println("Processing job:", id)
+			// Fetch full job
+			var job Job
+			var payloadBytes []byte
 
-			time.Sleep(1 * time.Second)
+			err = db.QueryRow(`
+				SELECT id, type, payload, status, run_at
+				FROM jobs
+				WHERE id = $1
+			`, id).Scan(&job.ID, &job.Type, &payloadBytes, &job.Status, &job.RunAt)
 
-			// Simulate random failure
-			if rand.Intn(2) == 0 {
-				log.Println("Job failed:", id)
+			if err != nil {
+				log.Println("Fetch error:", err)
+				continue
+			}
+
+			err = json.Unmarshal(payloadBytes, &job.Payload)
+			if err != nil {
+				log.Println("Unmarshal error:", err)
+				continue
+			}
+
+			log.Println("Executing job:", job.ID)
+
+			err = executeJob(job)
+
+			if err != nil {
+				log.Println("Execution failed:", err)
 
 				_, err = db.Exec(`
 					UPDATE jobs
@@ -75,10 +97,10 @@ func startWorker() {
 					retry_count = retry_count + 1,
 					updated_at = NOW()
 					WHERE id = $1
-				`, id)
+				`, job.ID)
 
 				if err != nil {
-					log.Println("Failed to update failed job:", err)
+					log.Println("Retry update failed:", err)
 				}
 
 				continue
@@ -90,16 +112,73 @@ func startWorker() {
 				SET status = 'completed',
 				    updated_at = NOW()
 				WHERE id = $1
-			`, id)
+			`, job.ID)
 
 			if err != nil {
-				log.Println("Failed to complete job:", err)
+				log.Println("Completion update failed:", err)
 			}
 		}
 	}
 }
 
-// -------------------- DB INIT --------------------
+// ==================== EXECUTION ====================
+
+func executeJob(job Job) error {
+	switch job.Type {
+
+	case "http_request":
+		return executeHTTPRequest(job.Payload)
+
+	default:
+		return fmt.Errorf("unknown job type: %s", job.Type)
+	}
+}
+
+func executeHTTPRequest(payload map[string]interface{}) error {
+	url, ok := payload["url"].(string)
+	if !ok {
+		return fmt.Errorf("missing url")
+	}
+
+	method := "GET"
+	if m, ok := payload["method"].(string); ok {
+		method = m
+	}
+
+	var bodyBytes []byte
+	if body, ok := payload["body"]; ok {
+		var err error
+		bodyBytes, err = json.Marshal(body)
+		if err != nil {
+			return err
+		}
+	}
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+	}
+
+	req, err := http.NewRequest(method, url, bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("http status %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// ==================== DB INIT ====================
 
 func initDB() {
 	connStr := "host=127.0.0.1 port=5433 user=goflow password=goflowpass dbname=goflowdb sslmode=disable"
@@ -107,68 +186,50 @@ func initDB() {
 	var err error
 	db, err = sql.Open("postgres", connStr)
 	if err != nil {
-		log.Fatal("Failed to open DB:", err)
+		log.Fatal(err)
 	}
 
 	err = db.Ping()
 	if err != nil {
-		log.Fatal("Failed to connect to DB:", err)
+		log.Fatal(err)
 	}
 
-	log.Println("Connected to Postgres successfully")
-
-	createTableQuery := `
+	createTable := `
 	CREATE TABLE IF NOT EXISTS jobs (
 		id SERIAL PRIMARY KEY,
 		type TEXT NOT NULL,
 		payload JSONB,
 		status TEXT NOT NULL,
 		retry_count INT DEFAULT 0,
-		run_at TIMESTAMP DEFAULT NOW(),
+		run_at TIMESTAMPTZ DEFAULT NOW(),
 		created_at TIMESTAMP DEFAULT NOW(),
 		updated_at TIMESTAMP DEFAULT NOW()
 	);
 	`
-
-	_, err = db.Exec(createTableQuery)
+	_, err = db.Exec(createTable)
 	if err != nil {
-		log.Fatal("Failed to create jobs table:", err)
+		log.Fatal(err)
 	}
 
-	createIndexQuery := `
-	CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-	`
-
-	_, err = db.Exec(createIndexQuery)
-	if err != nil {
-		log.Fatal("Failed to create index:", err)
-	}
-
-	log.Println("Jobs table ready")
+	log.Println("Database ready")
 }
 
-// -------------------- MAIN --------------------
+// ==================== API ====================
 
 func main() {
 	initDB()
-	rand.Seed(time.Now().UnixNano())
 
 	go startWorker()
 
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/jobs", jobsHandler)
 
-	log.Println("Starting GoFlow API on port 8080...")
+	log.Println("Server running on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// -------------------- HANDLERS --------------------
-
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
-		"status": "ok",
-	})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func jobsHandler(w http.ResponseWriter, r *http.Request) {
@@ -177,48 +238,44 @@ func jobsHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var req Job
 
-		err := json.NewDecoder(r.Body).Decode(&req)
-		if err != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
 		}
 
-		req.Status = "pending"
-
-		// Default run_at to now if not provided
 		if req.RunAt.IsZero() {
-			req.RunAt = time.Now()
+			req.RunAt = time.Now().UTC()
 		}
+
+		req.Status = "pending"
 
 		payloadJSON, err := json.Marshal(req.Payload)
 		if err != nil {
-			http.Error(w, "Failed to process payload", http.StatusInternalServerError)
+			http.Error(w, "Payload error", http.StatusInternalServerError)
 			return
 		}
 
-		query := `
-		INSERT INTO jobs (type, payload, status, run_at)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id;
-		`
+		err = db.QueryRow(`
+			INSERT INTO jobs (type, payload, status, run_at)
+			VALUES ($1, $2, $3, $4)
+			RETURNING id
+		`, req.Type, payloadJSON, req.Status, req.RunAt).Scan(&req.ID)
 
-		err = db.QueryRow(query, req.Type, payloadJSON, req.Status, req.RunAt).Scan(&req.ID)
 		if err != nil {
-			http.Error(w, "Failed to insert job", http.StatusInternalServerError)
+			http.Error(w, "Insert failed", http.StatusInternalServerError)
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(req)
 
 	case http.MethodGet:
 		rows, err := db.Query(`
 			SELECT id, type, payload, status, run_at
 			FROM jobs
-			ORDER BY id ASC
+			ORDER BY id
 		`)
 		if err != nil {
-			http.Error(w, "Failed to fetch jobs", http.StatusInternalServerError)
+			http.Error(w, "Query failed", http.StatusInternalServerError)
 			return
 		}
 		defer rows.Close()
@@ -231,20 +288,14 @@ func jobsHandler(w http.ResponseWriter, r *http.Request) {
 
 			err := rows.Scan(&job.ID, &job.Type, &payloadBytes, &job.Status, &job.RunAt)
 			if err != nil {
-				http.Error(w, "Failed to scan job", http.StatusInternalServerError)
+				http.Error(w, "Scan failed", http.StatusInternalServerError)
 				return
 			}
 
-			err = json.Unmarshal(payloadBytes, &job.Payload)
-			if err != nil {
-				http.Error(w, "Failed to parse payload", http.StatusInternalServerError)
-				return
-			}
-
+			json.Unmarshal(payloadBytes, &job.Payload)
 			jobs = append(jobs, job)
 		}
 
-		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(jobs)
 
 	default:
