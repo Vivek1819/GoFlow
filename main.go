@@ -1,18 +1,11 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"io"
 	"log"
 	"net/http"
-	"net/smtp"
 	"os"
 	"os/signal"
 	"sync"
@@ -20,6 +13,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"goflow/jobs"
 )
 
 type Job struct {
@@ -136,7 +130,7 @@ func processJob(workerID int, id int) {
 
 	start := time.Now()
 
-	statusCode, responseBody, execErr := executeJob(job)
+	statusCode, responseBody, execErr := jobs.Execute(job.Type, job.Payload)
 	// Ensure responseBody is valid JSON
 	var jsonCheck interface{}
 	if len(responseBody) > 0 && json.Unmarshal(responseBody, &jsonCheck) != nil {
@@ -181,224 +175,6 @@ func processJob(workerID int, id int) {
 	if err != nil {
 		log.Println("Completion update failed:", err)
 	}
-}
-
-// ==================== EXECUTION ====================
-
-func executeJob(job Job) (int, []byte, error) {
-	switch job.Type {
-
-	case "http_request":
-		return executeHTTPRequest(job.Payload)
-
-	case "send_email":
-		return executeSendEmail(job.Payload)
-
-	case "webhook_delivery":
-		return executeWebhookDelivery(job.Payload)
-
-	case "delay":
-		return executeDelay(job.Payload)
-
-	default:
-		return 0, nil, fmt.Errorf("unknown job type: %s", job.Type)
-	}
-}
-
-func executeHTTPRequest(payload map[string]interface{}) (int, []byte, error) {
-	url, ok := payload["url"].(string)
-	if !ok {
-		return 0, nil, fmt.Errorf("missing url")
-	}
-
-	method := "GET"
-	if m, ok := payload["method"].(string); ok {
-		method = m
-	}
-
-	var bodyBytes []byte
-	if body, ok := payload["body"]; ok {
-		var err error
-		bodyBytes, err = json.Marshal(body)
-		if err != nil {
-			return 0, nil, err
-		}
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-
-	req, err := http.NewRequest(method, url, bytes.NewBuffer(bodyBytes))
-	if err != nil {
-		return 0, nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
-
-	responseBytes, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode >= 400 {
-		return resp.StatusCode, responseBytes,
-			fmt.Errorf("http status %d", resp.StatusCode)
-	}
-
-	return resp.StatusCode, responseBytes, nil
-}
-
-func executeSendEmail(payload map[string]interface{}) (int, []byte, error) {
-
-	to, ok := payload["to"].(string)
-	if !ok {
-		return 0, nil, fmt.Errorf("missing 'to'")
-	}
-
-	subject, ok := payload["subject"].(string)
-	if !ok {
-		return 0, nil, fmt.Errorf("missing 'subject'")
-	}
-
-	body, ok := payload["body"].(string)
-	if !ok {
-		return 0, nil, fmt.Errorf("missing 'body'")
-	}
-
-	message := []byte(
-		"To: " + to + "\r\n" +
-			"Subject: " + subject + "\r\n" +
-			"MIME-version: 1.0;\r\n" +
-			"Content-Type: text/plain; charset=\"UTF-8\";\r\n\r\n" +
-			body + "\r\n",
-	)
-
-	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
-
-	err := smtp.SendMail(
-		smtpHost+":"+smtpPort,
-		auth,
-		smtpUser,
-		[]string{to},
-		message,
-	)
-
-	if err != nil {
-		return 500, nil, err
-	}
-
-	return 200, []byte(`{"message":"email sent"}`), nil
-}
-
-func executeWebhookDelivery(payload map[string]interface{}) (int, []byte, error) {
-
-	url, ok := payload["url"].(string)
-	if !ok {
-		return 0, nil, fmt.Errorf("missing url")
-	}
-
-	event, ok := payload["event"].(string)
-	if !ok {
-		return 0, nil, fmt.Errorf("missing event")
-	}
-
-	data := payload["data"]
-	secret, ok := payload["secret"].(string)
-	if !ok {
-		return 0, nil, fmt.Errorf("missing secret")
-	}
-
-	// Construct body
-	bodyMap := map[string]interface{}{
-		"event": event,
-		"data":  data,
-	}
-
-	bodyBytes, err := json.Marshal(bodyMap)
-	if err != nil {
-		return 0, nil, err
-	}
-
-	// Generate HMAC SHA256 signature
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write(bodyBytes)
-	signature := hex.EncodeToString(mac.Sum(nil))
-
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-	}
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(bodyBytes))
-	if err != nil {
-		return 0, nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-GoFlow-Signature", "sha256="+signature)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
-
-	responseBytes, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode >= 400 {
-		return resp.StatusCode, responseBytes,
-			fmt.Errorf("http status %d", resp.StatusCode)
-	}
-
-	return resp.StatusCode, responseBytes, nil
-}
-
-func executeDelay(payload map[string]interface{}) (int, []byte, error) {
-
-	secondsFloat, ok := payload["seconds"].(float64)
-	if !ok {
-		return 0, nil, fmt.Errorf("missing or invalid 'seconds'")
-	}
-	seconds := int(secondsFloat)
-
-	nextJobRaw, ok := payload["next_job"].(map[string]interface{})
-	if !ok {
-		return 0, nil, fmt.Errorf("missing or invalid 'next_job'")
-	}
-
-	nextType, ok := nextJobRaw["type"].(string)
-	if !ok {
-		return 0, nil, fmt.Errorf("next_job missing type")
-	}
-
-	nextPayload, ok := nextJobRaw["payload"].(map[string]interface{})
-	if !ok {
-		return 0, nil, fmt.Errorf("next_job missing payload")
-	}
-
-	payloadJSON, err := json.Marshal(nextPayload)
-	if err != nil {
-		return 0, nil, err
-	}
-
-	_, err = db.Exec(`
-		INSERT INTO jobs (type, payload, status, run_at)
-		VALUES ($1, $2, 'pending', NOW() + ($3 || ' seconds')::interval)
-	`, nextType, payloadJSON, seconds)
-
-	if err != nil {
-		return 0, nil, err
-	}
-
-	result := map[string]interface{}{
-		"scheduled_in_seconds": seconds,
-		"next_job_type":        nextType,
-	}
-
-	jsonBytes, _ := json.Marshal(result)
-
-	return 200, jsonBytes, nil
 }
 
 // ==================== DB INIT ====================
@@ -519,6 +295,7 @@ func startRecoveryLoop(ctx context.Context, wg *sync.WaitGroup) {
 func main() {
 
 	initDB()
+	jobs.DB = db
 	if smtpUser == "" || smtpPass == "" {
 		log.Fatal("SMTP credentials not set in environment variables")
 	}
