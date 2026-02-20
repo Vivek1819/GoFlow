@@ -24,7 +24,7 @@ var db *sql.DB
 
 // ==================== WORKER ====================
 
-func startWorker() {
+func startWorker(workerID int) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -81,7 +81,7 @@ func startWorker() {
 				continue
 			}
 
-			log.Println("Executing job:", job.ID)
+			log.Printf("[Worker %d] Executing job %d\n", workerID, job.ID)
 
 			err = executeJob(job)
 
@@ -219,7 +219,11 @@ func initDB() {
 func main() {
 	initDB()
 
-	go startWorker()
+	workerCount := 5
+
+	for i := 1; i <= workerCount; i++ {
+		go startWorker(i)
+	}
 
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/jobs", jobsHandler)
