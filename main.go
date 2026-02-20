@@ -2,12 +2,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
+	"io"
 
 	_ "github.com/lib/pq"
 )
@@ -27,10 +33,41 @@ const (
 	baseDelay  = 5 * time.Second
 )
 
+const processingTimeout = 30 * time.Second
+
+func recoverStuckJobs() {
+	result, err := db.Exec(`
+		UPDATE jobs
+		SET status = 'pending',
+		    updated_at = NOW()
+		WHERE status = 'processing'
+		AND updated_at < NOW() - ($1 || ' seconds')::interval
+	`, int(processingTimeout.Seconds()))
+
+	if err != nil {
+		log.Println("Recovery failed:", err)
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected > 0 {
+		log.Printf("Recovered %d stuck jobs\n", rowsAffected)
+	}
+}
+
 // ==================== WORKER ====================
 
-func startWorker(workerID int) {
+func startWorker(ctx context.Context, wg *sync.WaitGroup, workerID int) {
+	defer wg.Done()
+
 	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[Worker %d] Shutting down...\n", workerID)
+			return
+		default:
+		}
+
 		var id int
 
 		err := db.QueryRow(`
@@ -50,7 +87,6 @@ func startWorker(workerID int) {
 		`, maxRetries).Scan(&id)
 
 		if err == sql.ErrNoRows {
-			// No job available
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
@@ -88,41 +124,61 @@ func processJob(workerID int, id int) {
 
 	log.Printf("[Worker %d] Executing job %d\n", workerID, job.ID)
 
-	err = executeJob(job)
+	start := time.Now()
 
-	if err != nil {
-		handleRetry(workerID, job, err)
+	statusCode, responseBody, execErr := executeJob(job)
+
+	duration := time.Since(start).Milliseconds()
+
+	// 🔴 If execution failed
+	if execErr != nil {
+
+		_, _ = db.Exec(`
+			UPDATE jobs
+			SET last_error = $2,
+			    response_status = $3,
+			    response_body = $4,
+			    execution_time_ms = $5,
+			    updated_at = NOW()
+			WHERE id = $1
+		`, job.ID, execErr.Error(), statusCode, responseBody, duration)
+
+		handleRetry(workerID, job, execErr)
 		return
 	}
 
+	// 🟢 If execution succeeded
 	_, err = db.Exec(`
 		UPDATE jobs
 		SET status = 'completed',
+		    response_status = $2,
+		    response_body = $3,
+		    execution_time_ms = $4,
+		    last_error = NULL,
 		    updated_at = NOW()
 		WHERE id = $1
-	`, job.ID)
+	`, job.ID, statusCode, responseBody, duration)
 
 	if err != nil {
 		log.Println("Completion update failed:", err)
 	}
 }
+
 // ==================== EXECUTION ====================
 
-func executeJob(job Job) error {
+func executeJob(job Job) (int, []byte, error) {
 	switch job.Type {
-
 	case "http_request":
 		return executeHTTPRequest(job.Payload)
-
 	default:
-		return fmt.Errorf("unknown job type: %s", job.Type)
+		return 0, nil, fmt.Errorf("unknown job type: %s", job.Type)
 	}
 }
 
-func executeHTTPRequest(payload map[string]interface{}) error {
+func executeHTTPRequest(payload map[string]interface{}) (int, []byte, error) {
 	url, ok := payload["url"].(string)
 	if !ok {
-		return fmt.Errorf("missing url")
+		return 0, nil, fmt.Errorf("missing url")
 	}
 
 	method := "GET"
@@ -135,32 +191,33 @@ func executeHTTPRequest(payload map[string]interface{}) error {
 		var err error
 		bodyBytes, err = json.Marshal(body)
 		if err != nil {
-			return err
+			return 0, nil, err
 		}
 	}
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-	}
+	client := &http.Client{Timeout: 5 * time.Second}
 
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(bodyBytes))
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 
+	responseBytes, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("http status %d", resp.StatusCode)
+		return resp.StatusCode, responseBytes,
+			fmt.Errorf("http status %d", resp.StatusCode)
 	}
 
-	return nil
+	return resp.StatusCode, responseBytes, nil
 }
 
 // ==================== DB INIT ====================
@@ -181,19 +238,32 @@ func initDB() {
 
 	createTable := `
 	CREATE TABLE IF NOT EXISTS jobs (
-		id SERIAL PRIMARY KEY,
-		type TEXT NOT NULL,
-		payload JSONB,
-		status TEXT NOT NULL,
-		retry_count INT DEFAULT 0,
-		run_at TIMESTAMPTZ DEFAULT NOW(),
-		created_at TIMESTAMP DEFAULT NOW(),
-		updated_at TIMESTAMP DEFAULT NOW()
-	);
+	id SERIAL PRIMARY KEY,
+	type TEXT NOT NULL,
+	payload JSONB,
+	status TEXT NOT NULL,
+	retry_count INT DEFAULT 0,
+	run_at TIMESTAMPTZ DEFAULT NOW(),
+	last_error TEXT,
+	response_status INT,
+	response_body JSONB,
+	execution_time_ms INT,
+	created_at TIMESTAMP DEFAULT NOW(),
+	updated_at TIMESTAMP DEFAULT NOW()
+);
 	`
 	_, err = db.Exec(createTable)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	createReadyIndex := `
+	CREATE INDEX IF NOT EXISTS idx_jobs_ready
+	ON jobs (status, run_at);
+	`
+	_, err = db.Exec(createReadyIndex)
+	if err != nil {
+		log.Fatal("Failed to create ready index:", err)
 	}
 
 	log.Println("Database ready")
@@ -246,22 +316,76 @@ func handleRetry(workerID int, job Job, execErr error) {
 	}
 }
 
+func startRecoveryLoop(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[Recovery] Shutting down...")
+			return
+		case <-ticker.C:
+			recoverStuckJobs()
+		}
+	}
+}
+
 // ==================== API ====================
 
 func main() {
 	initDB()
+	recoverStuckJobs()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	wg := &sync.WaitGroup{}
 
 	workerCount := 5
 
 	for i := 1; i <= workerCount; i++ {
-		go startWorker(i)
+		wg.Add(1)
+		go startWorker(ctx, wg, i)
+	}
+
+	wg.Add(1)
+	go startRecoveryLoop(ctx, wg)
+
+	// Start HTTP server in goroutine
+	server := &http.Server{
+		Addr: ":8080",
 	}
 
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/jobs", jobsHandler)
 
-	log.Println("Server running on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	go func() {
+		log.Println("Server running on :8080")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	// Listen for OS signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	<-sigChan
+	log.Println("Shutdown signal received")
+
+	// Stop workers
+	cancel()
+
+	// Gracefully stop HTTP server
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	server.Shutdown(shutdownCtx)
+
+	// Wait for workers
+	wg.Wait()
+
+	log.Println("Graceful shutdown complete")
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
