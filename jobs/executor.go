@@ -35,6 +35,9 @@ func Execute(jobType string, payload map[string]interface{}) (int, []byte, error
 	case "db_query":
 		return executeDBQuery(payload)
 
+	case "callback":
+		return executeCallback(payload)
+
 	default:
 		return 0, nil, fmt.Errorf("unknown job type: %s", jobType)
 	}
