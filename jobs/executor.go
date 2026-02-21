@@ -32,6 +32,9 @@ func Execute(jobType string, payload map[string]interface{}) (int, []byte, error
 	case "ai_prompt":
 		return executeAIPrompt(payload)
 
+	case "db_query":
+		return executeDBQuery(payload)
+
 	default:
 		return 0, nil, fmt.Errorf("unknown job type: %s", jobType)
 	}
