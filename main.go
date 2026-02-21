@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -175,6 +179,76 @@ func processJob(workerID int, id int) {
 	if err != nil {
 		log.Println("Completion update failed:", err)
 	}
+
+	triggerAutoCallback(job.ID, job.Payload)
+}
+
+func triggerAutoCallback(jobID int, payload map[string]interface{}) {
+
+	callbackURL, ok := payload["callback_url"].(string)
+	if !ok || callbackURL == "" {
+		return
+	}
+
+	secret, _ := payload["callback_secret"].(string)
+
+	var status string
+	var responseBody []byte
+	var lastError *string
+
+	err := db.QueryRow(`
+		SELECT status, response_body, last_error
+		FROM jobs
+		WHERE id = $1
+	`, jobID).Scan(&status, &responseBody, &lastError)
+
+	if err != nil {
+		log.Println("Auto callback fetch failed:", err)
+		return
+	}
+
+	body := map[string]interface{}{
+		"job_id": jobID,
+		"status": status,
+	}
+
+	if responseBody != nil {
+		var parsed interface{}
+		json.Unmarshal(responseBody, &parsed)
+		body["response"] = parsed
+	}
+
+	if lastError != nil {
+		body["error"] = *lastError
+	}
+
+	bodyBytes, _ := json.Marshal(body)
+
+	req, err := http.NewRequest("POST", callbackURL, bytes.NewBuffer(bodyBytes))
+	if err != nil {
+		log.Println("Auto callback request error:", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	if secret != "" {
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write(bodyBytes)
+		signature := hex.EncodeToString(mac.Sum(nil))
+		req.Header.Set("X-GoFlow-Signature", "sha256="+signature)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Println("Auto callback send failed:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	log.Printf("Auto callback sent for job %d\n", jobID)
 }
 
 // ==================== DB INIT ====================
@@ -251,6 +325,7 @@ func handleRetry(workerID int, job Job, execErr error) {
 		if err != nil {
 			log.Println("Failed to mark job failed:", err)
 		}
+		triggerAutoCallback(job.ID, job.Payload)
 		return
 	}
 
