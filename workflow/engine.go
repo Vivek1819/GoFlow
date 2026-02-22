@@ -81,14 +81,48 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 		return
 	}
 
+	// ============================
+	// Failure Propagation
+	// ============================
+
+	var jobStatus string
+
+	err := DB.QueryRow(`
+	SELECT status
+	FROM jobs
+	WHERE id = $1
+`, jobID).Scan(&jobStatus)
+
+	if err != nil {
+		log.Println("Failed to fetch job status:", err)
+		return
+	}
+
 	workflowID := int(wfIDRaw.(float64))
+
+	if jobStatus == "failed" {
+
+		_, err := DB.Exec(`
+		UPDATE workflows
+		SET status = 'failed',
+		    updated_at = NOW()
+		WHERE id = $1
+	`, workflowID)
+
+		if err != nil {
+			log.Println("Workflow failure update failed:", err)
+		}
+
+		return
+	}
+
 	stepIndex := int(payload["step_index"].(float64))
 	stepID := payload["step_id"].(string)
 
 	var stepsJSON []byte
 	var contextJSON []byte
 
-	err := DB.QueryRow(`
+	err = DB.QueryRow(`
 		SELECT steps, context
 		FROM workflows
 		WHERE id = $1
