@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"goflow/workflow"
 )
 
 var DB *sql.DB
@@ -37,6 +38,9 @@ func Execute(jobType string, payload map[string]interface{}) (int, []byte, error
 
 	case "callback":
 		return executeCallback(payload)
+
+	case "workflow":
+		return workflow.Start(payload)
 
 	default:
 		return 0, nil, fmt.Errorf("unknown job type: %s", jobType)

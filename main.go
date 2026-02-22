@@ -18,6 +18,7 @@ import (
 
 	_ "github.com/lib/pq"
 	"goflow/jobs"
+	"goflow/workflow"
 )
 
 type Job struct {
@@ -181,6 +182,7 @@ func processJob(workerID int, id int) {
 	}
 
 	triggerAutoCallback(job.ID, job.Payload)
+	workflow.AdvanceIfNeeded(job.ID, job.Payload, responseBody)
 }
 
 func triggerAutoCallback(jobID int, payload map[string]interface{}) {
@@ -297,6 +299,22 @@ func initDB() {
 		log.Fatal("Failed to create ready index:", err)
 	}
 
+	createWorkflowTable := `
+CREATE TABLE IF NOT EXISTS workflows (
+	id SERIAL PRIMARY KEY,
+	status TEXT NOT NULL,
+	current_step INT DEFAULT 0,
+	steps JSONB NOT NULL,
+	context JSONB DEFAULT '{}'::jsonb,
+	created_at TIMESTAMP DEFAULT NOW(),
+	updated_at TIMESTAMP DEFAULT NOW()
+);
+`
+	_, err = db.Exec(createWorkflowTable)
+	if err != nil {
+		log.Fatal("Failed to create workflows table:", err)
+	}
+
 	log.Println("Database ready")
 }
 
@@ -371,6 +389,7 @@ func main() {
 
 	initDB()
 	jobs.DB = db
+	workflow.DB = db
 	if smtpUser == "" || smtpPass == "" {
 		log.Fatal("SMTP credentials not set in environment variables")
 	}
