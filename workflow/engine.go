@@ -93,126 +93,164 @@ func Start(payload map[string]interface{}) (int, []byte, error) {
 
 func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte) {
 
-	wfIDRaw, ok := payload["workflow_id"]
-	if !ok {
-		return
-	}
+    wfIDRaw, ok := payload["workflow_id"]
+    if !ok {
+        return
+    }
 
-	workflowID := int(wfIDRaw.(float64))
+    workflowID := int(wfIDRaw.(float64))
 
-	// Failure propagation
-	var jobStatus string
+    // Get job status
+    var jobStatus string
+    err := DB.QueryRow(`
+        SELECT status FROM jobs WHERE id = $1
+    `, jobID).Scan(&jobStatus)
 
-	err := DB.QueryRow(`
-		SELECT status FROM jobs WHERE id = $1
-	`, jobID).Scan(&jobStatus)
+    if err != nil {
+        log.Println("Failed to fetch job status:", err)
+        return
+    }
 
-	if err != nil {
-		log.Println("Failed to fetch job status:", err)
-		return
-	}
+    // Update step run
+    _, err = DB.Exec(`
+        UPDATE workflow_step_runs
+        SET status = $1,
+            finished_at = NOW(),
+            response_snapshot = $2,
+            error = CASE WHEN $1 = 'failed' THEN 'Step execution failed' ELSE NULL END
+        WHERE job_id = $3
+    `, jobStatus, response, jobID)
 
-	// Update step run
-	_, updateErr := DB.Exec(`
-		UPDATE workflow_step_runs
-		SET status = $1,
-			finished_at = NOW(),
-			response_snapshot = $2,
-			error = CASE WHEN $1 = 'failed' THEN 'Step execution failed' ELSE NULL END
-		WHERE job_id = $3
-	`, jobStatus, response, jobID)
+    if err != nil {
+        log.Println("Failed to update workflow_step_run:", err)
+    }
 
-	if updateErr != nil {
-		log.Println("Failed to update workflow_step_run:", updateErr)
-	}
+    if jobStatus == "failed" {
+        DB.Exec(`
+            UPDATE workflows
+            SET status = 'failed', updated_at = NOW()
+            WHERE id = $1
+        `, workflowID)
+        return
+    }
 
-	if jobStatus == "failed" {
-		DB.Exec(`
-			UPDATE workflows
-			SET status = 'failed', updated_at = NOW()
-			WHERE id = $1
-		`, workflowID)
-		return
-	}
+    // Load workflow steps + context
+    var stepsJSON []byte
+    var contextJSON []byte
 
-	if branchVal, exists := payload["branch"]; exists {
-		if isBranch, ok := branchVal.(bool); ok && isBranch {
+    err = DB.QueryRow(`
+        SELECT steps, context FROM workflows WHERE id = $1
+    `, workflowID).Scan(&stepsJSON, &contextJSON)
 
-			DB.Exec(`
+    if err != nil {
+        log.Println("Workflow fetch failed:", err)
+        return
+    }
+
+    var steps []map[string]interface{}
+    json.Unmarshal(stepsJSON, &steps)
+
+    var contextMap map[string]interface{}
+    if contextJSON == nil {
+        contextMap = make(map[string]interface{})
+    } else {
+        json.Unmarshal(contextJSON, &contextMap)
+    }
+
+    // Store response in context
+    stepID := payload["step_id"].(string)
+
+    var parsed interface{}
+    json.Unmarshal(response, &parsed)
+
+    contextMap[stepID] = map[string]interface{}{
+        "response": parsed,
+    }
+
+    newContextJSON, _ := json.Marshal(contextMap)
+
+    DB.Exec(`
+        UPDATE workflows
+        SET context = $2, updated_at = NOW()
+        WHERE id = $1
+    `, workflowID, newContextJSON)
+
+    // =========================
+    // PARALLEL CHILD LOGIC
+    // =========================
+
+    if parentIDRaw, exists := payload["parent_parallel_step"]; exists {
+
+        parentStepID := parentIDRaw.(string)
+
+        var total int
+        var completed int
+
+        err := DB.QueryRow(`
+            SELECT 
+                COUNT(*),
+                COUNT(*) FILTER (WHERE status = 'completed')
+            FROM workflow_step_runs
+            WHERE workflow_id = $1
+              AND parent_step_id = $2
+              AND is_parallel_child = TRUE
+        `, workflowID, parentStepID).Scan(&total, &completed)
+
+        if err != nil {
+            log.Println("Parallel barrier check failed:", err)
+            return
+        }
+
+        if completed < total {
+            return
+        }
+
+        parentIndex := findStepIndexByID(steps, parentStepID)
+        nextIndex := parentIndex + 1
+
+        if nextIndex >= len(steps) {
+            DB.Exec(`
+                UPDATE workflows
+                SET status = 'completed', updated_at = NOW()
+                WHERE id = $1
+            `, workflowID)
+            return
+        }
+
+        spawnStep(workflowID, steps, nextIndex, contextMap, false)
+        return
+    }
+
+    // =========================
+    // SEQUENTIAL LOGIC
+    // =========================
+
+    stepIndex := int(payload["step_index"].(float64))
+    nextIndex := stepIndex + 1
+
+    if nextIndex >= len(steps) {
+        DB.Exec(`
             UPDATE workflows
             SET status = 'completed', updated_at = NOW()
             WHERE id = $1
         `, workflowID)
+        return
+    }
 
-			return
-		}
-	}
+    nextStep := steps[nextIndex]
+    nextType := nextStep["type"].(string)
 
-	stepIndex := int(payload["step_index"].(float64))
-	stepID := payload["step_id"].(string)
+    if nextType == "condition" {
+        handleCondition(workflowID, steps, nextStep, contextMap)
+        return
+    }
 
-	var stepsJSON []byte
-	var contextJSON []byte
+    if nextType == "parallel" {
+        handleParallel(workflowID, steps, nextStep, contextMap)
+        return
+    }
 
-	err = DB.QueryRow(`
-		SELECT steps, context FROM workflows WHERE id = $1
-	`, workflowID).Scan(&stepsJSON, &contextJSON)
-
-	if err != nil {
-		log.Println("Workflow fetch failed:", err)
-		return
-	}
-
-	// Parse context
-	var contextMap map[string]interface{}
-	if contextJSON == nil {
-		contextMap = make(map[string]interface{})
-	} else {
-		json.Unmarshal(contextJSON, &contextMap)
-	}
-
-	// Store response
-	var parsed interface{}
-	json.Unmarshal(response, &parsed)
-
-	contextMap[stepID] = map[string]interface{}{
-		"response": parsed,
-	}
-
-	newContextJSON, _ := json.Marshal(contextMap)
-
-	DB.Exec(`
-		UPDATE workflows
-		SET context = $2, updated_at = NOW()
-		WHERE id = $1
-	`, workflowID, newContextJSON)
-
-	// Parse steps
-	var steps []map[string]interface{}
-	json.Unmarshal(stepsJSON, &steps)
-
-	nextIndex := stepIndex + 1
-
-	if nextIndex >= len(steps) {
-		DB.Exec(`
-			UPDATE workflows
-			SET status = 'completed', updated_at = NOW()
-			WHERE id = $1
-		`, workflowID)
-		return
-	}
-
-	nextStep := steps[nextIndex]
-	nextType := nextStep["type"].(string)
-
-	// Handle condition step
-	if nextType == "condition" {
-		handleCondition(workflowID, steps, nextStep, contextMap)
-		return
-	}
-
-	// Normal step
-	spawnStep(workflowID, steps, nextIndex, contextMap, false)
+    spawnStep(workflowID, steps, nextIndex, contextMap, false)
 }
 
 // ============================
@@ -242,6 +280,55 @@ func handleCondition(workflowID int, steps []map[string]interface{}, step map[st
 			targetID := rule["next"].(string)
 			spawnByID(workflowID, steps, targetID, context)
 			return
+		}
+	}
+}
+
+func handleParallel(workflowID int, steps []map[string]interface{}, step map[string]interface{}, context map[string]interface{}) {
+
+	rawBranches, ok := step["branches"].([]interface{})
+	if !ok || len(rawBranches) == 0 {
+		log.Println("Invalid parallel branches")
+		return
+	}
+
+	parentStepID := step["id"].(string)
+
+	for _, b := range rawBranches {
+
+		branch := b.(map[string]interface{})
+
+		branchType := branch["type"].(string)
+		branchPayload := branch["payload"].(map[string]interface{})
+
+		interpolated := interpolatePayload(branchPayload, context)
+
+		interpolated["workflow_id"] = workflowID
+		interpolated["step_id"] = branch["id"]
+		interpolated["parent_parallel_step"] = parentStepID
+
+		payloadJSON, _ := json.Marshal(interpolated)
+
+		var jobID int
+		err := DB.QueryRow(`
+            INSERT INTO jobs (type, payload, status)
+            VALUES ($1, $2, 'pending')
+            RETURNING id
+        `, branchType, payloadJSON).Scan(&jobID)
+
+		if err != nil {
+			log.Println("Failed spawning parallel branch:", err)
+			continue
+		}
+
+		_, err = DB.Exec(`
+            INSERT INTO workflow_step_runs 
+            (workflow_id, step_id, job_id, status, parent_step_id, is_parallel_child)
+            VALUES ($1, $2, $3, 'running', $4, TRUE)
+        `, workflowID, branch["id"].(string), jobID, parentStepID)
+
+		if err != nil {
+			log.Println("Failed inserting parallel step_run:", err)
 		}
 	}
 }

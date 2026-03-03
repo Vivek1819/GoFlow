@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -27,6 +29,27 @@ type Job struct {
 	Payload map[string]interface{} `json:"payload"`
 	Status  string                 `json:"status"`
 	RunAt   time.Time              `json:"run_at"`
+}
+
+type Workflow struct {
+	ID        int             `json:"id"`
+	Status    string          `json:"status"`
+	Steps     json.RawMessage `json:"steps"`
+	Context   json.RawMessage `json:"context"`
+	CreatedAt time.Time       `json:"created_at"`
+	UpdatedAt time.Time       `json:"updated_at"`
+}
+
+type WorkflowStepRun struct {
+	ID               int             `json:"id"`
+	WorkflowID       int             `json:"workflow_id"`
+	StepID           string          `json:"step_id"`
+	JobID            int             `json:"job_id"`
+	Status           string          `json:"status"`
+	StartedAt        time.Time       `json:"started_at"`
+	FinishedAt       *time.Time      `json:"finished_at"`
+	Error            *string         `json:"error"`
+	ResponseSnapshot json.RawMessage `json:"response_snapshot"`
 }
 
 var db *sql.DB
@@ -352,16 +375,20 @@ func handleRetry(workerID int, job Job, execErr error) {
 
 	if retryCount+1 >= maxRetries {
 		_, err = db.Exec(`
-			UPDATE jobs
-			SET status = 'failed',
-			    retry_count = retry_count + 1,
-			    updated_at = NOW()
-			WHERE id = $1
-		`, job.ID)
+        UPDATE jobs
+        SET status = 'failed',
+            retry_count = retry_count + 1,
+            updated_at = NOW()
+        WHERE id = $1
+    `, job.ID)
 
 		if err != nil {
 			log.Println("Failed to mark job failed:", err)
 		}
+
+		// 🔥 Notify workflow engine of terminal failure
+		workflow.AdvanceIfNeeded(job.ID, job.Payload, []byte(`{}`))
+
 		triggerAutoCallback(job.ID, job.Payload)
 		return
 	}
@@ -434,6 +461,9 @@ func main() {
 
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/jobs", jobsHandler)
+	http.HandleFunc("/workflows", workflowsHandler)
+	http.HandleFunc("/workflows/", workflowDetailHandler)
+	http.HandleFunc("/jobs/", jobDetailHandler)
 
 	go func() {
 		log.Println("Server running on :8080")
@@ -536,4 +566,185 @@ func jobsHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func workflowsHandler(w http.ResponseWriter, r *http.Request) {
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	rows, err := db.Query(`
+		SELECT id, status, steps, context, created_at, updated_at
+		FROM workflows
+		ORDER BY id DESC
+	`)
+	if err != nil {
+		http.Error(w, "Query failed", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var workflows []Workflow
+
+	for rows.Next() {
+		var wf Workflow
+		err := rows.Scan(
+			&wf.ID,
+			&wf.Status,
+			&wf.Steps,
+			&wf.Context,
+			&wf.CreatedAt,
+			&wf.UpdatedAt,
+		)
+		if err != nil {
+			http.Error(w, "Scan failed", http.StatusInternalServerError)
+			return
+		}
+		workflows = append(workflows, wf)
+	}
+
+	json.NewEncoder(w).Encode(workflows)
+}
+
+func workflowDetailHandler(w http.ResponseWriter, r *http.Request) {
+
+	path := strings.TrimPrefix(r.URL.Path, "/workflows/")
+	parts := strings.Split(path, "/")
+
+	idStr := parts[0]
+	workflowID, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, "Invalid workflow id", http.StatusBadRequest)
+		return
+	}
+
+	// /workflows/{id}/steps
+	if len(parts) == 2 && parts[1] == "steps" {
+		getWorkflowSteps(w, workflowID)
+		return
+	}
+
+	// /workflows/{id}/context
+	if len(parts) == 2 && parts[1] == "context" {
+		getWorkflowContext(w, workflowID)
+		return
+	}
+
+	// Default: workflow metadata
+	var wf Workflow
+	err = db.QueryRow(`
+		SELECT id, status, steps, context, created_at, updated_at
+		FROM workflows
+		WHERE id = $1
+	`, workflowID).Scan(
+		&wf.ID,
+		&wf.Status,
+		&wf.Steps,
+		&wf.Context,
+		&wf.CreatedAt,
+		&wf.UpdatedAt,
+	)
+
+	if err != nil {
+		http.Error(w, "Workflow not found", http.StatusNotFound)
+		return
+	}
+
+	json.NewEncoder(w).Encode(wf)
+}
+
+func getWorkflowSteps(w http.ResponseWriter, workflowID int) {
+
+	rows, err := db.Query(`
+		SELECT id, workflow_id, step_id, job_id, status,
+		       started_at, finished_at, error, response_snapshot
+		FROM workflow_step_runs
+		WHERE workflow_id = $1
+		ORDER BY id
+	`, workflowID)
+
+	if err != nil {
+		http.Error(w, "Query failed", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var steps []WorkflowStepRun
+
+	for rows.Next() {
+		var s WorkflowStepRun
+		err := rows.Scan(
+			&s.ID,
+			&s.WorkflowID,
+			&s.StepID,
+			&s.JobID,
+			&s.Status,
+			&s.StartedAt,
+			&s.FinishedAt,
+			&s.Error,
+			&s.ResponseSnapshot,
+		)
+		if err != nil {
+			http.Error(w, "Scan failed", http.StatusInternalServerError)
+			return
+		}
+		steps = append(steps, s)
+	}
+
+	json.NewEncoder(w).Encode(steps)
+}
+
+func getWorkflowContext(w http.ResponseWriter, workflowID int) {
+
+	var context json.RawMessage
+
+	err := db.QueryRow(`
+		SELECT context
+		FROM workflows
+		WHERE id = $1
+	`, workflowID).Scan(&context)
+
+	if err != nil {
+		http.Error(w, "Workflow not found", http.StatusNotFound)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]json.RawMessage{
+		"context": context,
+	})
+}
+
+func jobDetailHandler(w http.ResponseWriter, r *http.Request) {
+
+	idStr := strings.TrimPrefix(r.URL.Path, "/jobs/")
+	jobID, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, "Invalid job id", http.StatusBadRequest)
+		return
+	}
+
+	var job Job
+	var payloadBytes []byte
+
+	err = db.QueryRow(`
+		SELECT id, type, payload, status, run_at
+		FROM jobs
+		WHERE id = $1
+	`, jobID).Scan(
+		&job.ID,
+		&job.Type,
+		&payloadBytes,
+		&job.Status,
+		&job.RunAt,
+	)
+
+	if err != nil {
+		http.Error(w, "Job not found", http.StatusNotFound)
+		return
+	}
+
+	json.Unmarshal(payloadBytes, &job.Payload)
+	json.NewEncoder(w).Encode(job)
 }
