@@ -315,6 +315,25 @@ CREATE TABLE IF NOT EXISTS workflows (
 		log.Fatal("Failed to create workflows table:", err)
 	}
 
+	createWorkflowStepRuns := `
+CREATE TABLE IF NOT EXISTS workflow_step_runs (
+	id SERIAL PRIMARY KEY,
+	workflow_id INT NOT NULL,
+	step_id TEXT NOT NULL,
+	job_id INT NOT NULL,
+	status TEXT NOT NULL,
+	started_at TIMESTAMP DEFAULT NOW(),
+	finished_at TIMESTAMP,
+	error TEXT,
+	response_snapshot JSONB,
+	created_at TIMESTAMP DEFAULT NOW()
+);
+`
+	_, err = db.Exec(createWorkflowStepRuns)
+	if err != nil {
+		log.Fatal("Failed to create workflow_step_runs table:", err)
+	}
+
 	log.Println("Database ready")
 }
 

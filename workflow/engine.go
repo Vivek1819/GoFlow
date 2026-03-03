@@ -52,10 +52,27 @@ func Start(payload map[string]interface{}) (int, []byte, error) {
 
 	payloadJSON, _ := json.Marshal(stepPayload)
 
-	_, err = DB.Exec(`
+	var jobID int
+
+	err = DB.QueryRow(`
 		INSERT INTO jobs (type, payload, status)
 		VALUES ($1, $2, 'pending')
-	`, stepType, payloadJSON)
+		RETURNING id
+	`, stepType, payloadJSON).Scan(&jobID)
+
+	if err != nil {
+		return 0, nil, err
+	}
+
+	// Insert step run log
+	_, err = DB.Exec(`
+		INSERT INTO workflow_step_runs (workflow_id, step_id, job_id, status)
+		VALUES ($1, $2, $3, 'running')
+	`, workflowID, firstStep["id"].(string), jobID)
+
+	if err != nil {
+		log.Println("Failed to insert workflow_step_run for first step:", err)
+	}
 
 	if err != nil {
 		return 0, nil, err
@@ -83,22 +100,9 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 
 	workflowID := int(wfIDRaw.(float64))
 
-	// If this was a branch-spawned job, do NOT continue sequentially
-	if branchVal, exists := payload["branch"]; exists {
-		if isBranch, ok := branchVal.(bool); ok && isBranch {
-
-		DB.Exec(`
-            UPDATE workflows
-            SET status = 'completed', updated_at = NOW()
-            WHERE id = $1
-        `, workflowID)
-
-			return
-		}
-	}
-
 	// Failure propagation
 	var jobStatus string
+
 	err := DB.QueryRow(`
 		SELECT status FROM jobs WHERE id = $1
 	`, jobID).Scan(&jobStatus)
@@ -108,6 +112,20 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 		return
 	}
 
+	// Update step run
+	_, updateErr := DB.Exec(`
+		UPDATE workflow_step_runs
+		SET status = $1,
+			finished_at = NOW(),
+			response_snapshot = $2,
+			error = CASE WHEN $1 = 'failed' THEN 'Step execution failed' ELSE NULL END
+		WHERE job_id = $3
+	`, jobStatus, response, jobID)
+
+	if updateErr != nil {
+		log.Println("Failed to update workflow_step_run:", updateErr)
+	}
+
 	if jobStatus == "failed" {
 		DB.Exec(`
 			UPDATE workflows
@@ -115,6 +133,19 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 			WHERE id = $1
 		`, workflowID)
 		return
+	}
+
+	if branchVal, exists := payload["branch"]; exists {
+		if isBranch, ok := branchVal.(bool); ok && isBranch {
+
+			DB.Exec(`
+            UPDATE workflows
+            SET status = 'completed', updated_at = NOW()
+            WHERE id = $1
+        `, workflowID)
+
+			return
+		}
 	}
 
 	stepIndex := int(payload["step_index"].(float64))
@@ -237,13 +268,26 @@ func spawnStep(workflowID int, steps []map[string]interface{}, index int, contex
 
 	payloadJSON, _ := json.Marshal(nextPayload)
 
-	_, err := DB.Exec(`
+	var jobID int
+
+	err := DB.QueryRow(`
 		INSERT INTO jobs (type, payload, status)
 		VALUES ($1, $2, 'pending')
-	`, nextType, payloadJSON)
+		RETURNING id
+	`, nextType, payloadJSON).Scan(&jobID)
 
 	if err != nil {
 		log.Println("Failed to spawn step:", err)
+		return
+	}
+
+	_, err = DB.Exec(`
+		INSERT INTO workflow_step_runs (workflow_id, step_id, job_id, status)
+		VALUES ($1, $2, $3, 'running')
+	`, workflowID, nextStep["id"].(string), jobID)
+
+	if err != nil {
+		log.Println("Failed to insert workflow_step_run:", err)
 	}
 }
 
