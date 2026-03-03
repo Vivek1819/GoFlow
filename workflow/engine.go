@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -30,8 +31,8 @@ func Start(payload map[string]interface{}) (int, []byte, error) {
 	var workflowID int
 
 	err = DB.QueryRow(`
-		INSERT INTO workflows (status, current_step, steps)
-		VALUES ('running', 0, $1)
+		INSERT INTO workflows (status, steps)
+		VALUES ('running', $1)
 		RETURNING id
 	`, stepsJSON).Scan(&workflowID)
 
@@ -45,7 +46,6 @@ func Start(payload map[string]interface{}) (int, []byte, error) {
 	stepType := firstStep["type"].(string)
 	stepPayload := firstStep["payload"].(map[string]interface{})
 
-	// Inject workflow metadata
 	stepPayload["workflow_id"] = workflowID
 	stepPayload["step_index"] = 0
 	stepPayload["step_id"] = firstStep["id"]
@@ -71,7 +71,7 @@ func Start(payload map[string]interface{}) (int, []byte, error) {
 }
 
 // ============================
-// Advance Workflow (Sequential)
+// Advance Workflow
 // ============================
 
 func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte) {
@@ -81,38 +81,39 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 		return
 	}
 
-	// ============================
-	// Failure Propagation
-	// ============================
+	workflowID := int(wfIDRaw.(float64))
 
+	// If this was a branch-spawned job, do NOT continue sequentially
+	if branchVal, exists := payload["branch"]; exists {
+		if isBranch, ok := branchVal.(bool); ok && isBranch {
+
+		DB.Exec(`
+            UPDATE workflows
+            SET status = 'completed', updated_at = NOW()
+            WHERE id = $1
+        `, workflowID)
+
+			return
+		}
+	}
+
+	// Failure propagation
 	var jobStatus string
-
 	err := DB.QueryRow(`
-	SELECT status
-	FROM jobs
-	WHERE id = $1
-`, jobID).Scan(&jobStatus)
+		SELECT status FROM jobs WHERE id = $1
+	`, jobID).Scan(&jobStatus)
 
 	if err != nil {
 		log.Println("Failed to fetch job status:", err)
 		return
 	}
 
-	workflowID := int(wfIDRaw.(float64))
-
 	if jobStatus == "failed" {
-
-		_, err := DB.Exec(`
-		UPDATE workflows
-		SET status = 'failed',
-		    updated_at = NOW()
-		WHERE id = $1
-	`, workflowID)
-
-		if err != nil {
-			log.Println("Workflow failure update failed:", err)
-		}
-
+		DB.Exec(`
+			UPDATE workflows
+			SET status = 'failed', updated_at = NOW()
+			WHERE id = $1
+		`, workflowID)
 		return
 	}
 
@@ -123,9 +124,7 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 	var contextJSON []byte
 
 	err = DB.QueryRow(`
-		SELECT steps, context
-		FROM workflows
-		WHERE id = $1
+		SELECT steps, context FROM workflows WHERE id = $1
 	`, workflowID).Scan(&stepsJSON, &contextJSON)
 
 	if err != nil {
@@ -141,7 +140,7 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 		json.Unmarshal(contextJSON, &contextMap)
 	}
 
-	// Store response in context
+	// Store response
 	var parsed interface{}
 	json.Unmarshal(response, &parsed)
 
@@ -151,19 +150,11 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 
 	newContextJSON, _ := json.Marshal(contextMap)
 
-	// Update workflow context + step index
-	_, err = DB.Exec(`
+	DB.Exec(`
 		UPDATE workflows
-		SET context = $2,
-		    current_step = current_step + 1,
-		    updated_at = NOW()
+		SET context = $2, updated_at = NOW()
 		WHERE id = $1
 	`, workflowID, newContextJSON)
-
-	if err != nil {
-		log.Println("Workflow update failed:", err)
-		return
-	}
 
 	// Parse steps
 	var steps []map[string]interface{}
@@ -172,56 +163,187 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 	nextIndex := stepIndex + 1
 
 	if nextIndex >= len(steps) {
-		// Final step completed
-		_, err := DB.Exec(`
+		DB.Exec(`
 			UPDATE workflows
-			SET status = 'completed',
-			    updated_at = NOW()
+			SET status = 'completed', updated_at = NOW()
 			WHERE id = $1
 		`, workflowID)
-
-		if err != nil {
-			log.Println("Workflow completion update failed:", err)
-		}
-
 		return
 	}
 
-	// Spawn next step
 	nextStep := steps[nextIndex]
+	nextType := nextStep["type"].(string)
+
+	// Handle condition step
+	if nextType == "condition" {
+		handleCondition(workflowID, steps, nextStep, contextMap)
+		return
+	}
+
+	// Normal step
+	spawnStep(workflowID, steps, nextIndex, contextMap, false)
+}
+
+// ============================
+// Condition Handling
+// ============================
+
+func handleCondition(workflowID int, steps []map[string]interface{}, step map[string]interface{}, context map[string]interface{}) {
+
+	rawRules, ok := step["rules"].([]interface{})
+	if !ok {
+		log.Println("Invalid condition rules")
+		return
+	}
+
+	for _, r := range rawRules {
+
+		rule := r.(map[string]interface{})
+
+		// ELSE rule
+		if elseVal, exists := rule["else"]; exists && elseVal.(bool) {
+			targetID := rule["next"].(string)
+			spawnByID(workflowID, steps, targetID, context)
+			return
+		}
+
+		if evaluateRule(rule, context) {
+			targetID := rule["next"].(string)
+			spawnByID(workflowID, steps, targetID, context)
+			return
+		}
+	}
+}
+
+// ============================
+// Spawn Helpers
+// ============================
+
+func spawnStep(workflowID int, steps []map[string]interface{}, index int, context map[string]interface{}, isBranch bool) {
+
+	nextStep := steps[index]
 
 	nextType := nextStep["type"].(string)
 	originalPayload := nextStep["payload"].(map[string]interface{})
-	nextPayload := interpolatePayload(originalPayload, contextMap)
+	nextPayload := interpolatePayload(originalPayload, context)
 
 	nextPayload["workflow_id"] = workflowID
-	nextPayload["step_index"] = nextIndex
+	nextPayload["step_index"] = index
 	nextPayload["step_id"] = nextStep["id"]
+
+	if isBranch {
+		nextPayload["branch"] = true
+	}
 
 	payloadJSON, _ := json.Marshal(nextPayload)
 
-	_, err = DB.Exec(`
+	_, err := DB.Exec(`
 		INSERT INTO jobs (type, payload, status)
 		VALUES ($1, $2, 'pending')
 	`, nextType, payloadJSON)
 
 	if err != nil {
-		log.Println("Failed to insert next workflow job:", err)
+		log.Println("Failed to spawn step:", err)
 	}
 }
 
+func spawnByID(workflowID int, steps []map[string]interface{}, targetID string, context map[string]interface{}) {
+
+	index := findStepIndexByID(steps, targetID)
+	if index == -1 {
+		log.Println("Target step not found:", targetID)
+		return
+	}
+
+	spawnStep(workflowID, steps, index, context, true)
+}
+
+func findStepIndexByID(steps []map[string]interface{}, id string) int {
+	for i, s := range steps {
+		if s["id"].(string) == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// ============================
+// Rule Evaluation
+// ============================
+
+func evaluateRule(rule map[string]interface{}, context map[string]interface{}) bool {
+
+	path := rule["path"].(string)
+	operator := rule["operator"].(string)
+	expected := rule["value"]
+
+	actualStr := resolvePath(path, context)
+	if actualStr == "" {
+		return false
+	}
+
+	switch operator {
+	case "==":
+		return actualStr == stringify(expected)
+	case "!=":
+		return actualStr != stringify(expected)
+	case "contains":
+		return strings.Contains(actualStr, stringify(expected))
+	case ">":
+		return compareNumeric(actualStr, expected, ">")
+	case "<":
+		return compareNumeric(actualStr, expected, "<")
+	case ">=":
+		return compareNumeric(actualStr, expected, ">=")
+	case "<=":
+		return compareNumeric(actualStr, expected, "<=")
+	}
+
+	return false
+}
+
+func compareNumeric(actualStr string, expected interface{}, op string) bool {
+
+	actualFloat, err := strconv.ParseFloat(actualStr, 64)
+	if err != nil {
+		return false
+	}
+
+	expectedFloat, ok := expected.(float64)
+	if !ok {
+		return false
+	}
+
+	switch op {
+	case ">":
+		return actualFloat > expectedFloat
+	case "<":
+		return actualFloat < expectedFloat
+	case ">=":
+		return actualFloat >= expectedFloat
+	case "<=":
+		return actualFloat <= expectedFloat
+	}
+
+	return false
+}
+
+// ============================
+// Interpolation
+// ============================
+
+var templateRegex = regexp.MustCompile(`\{\{([^}]+)\}\}`)
+
 func interpolatePayload(payload map[string]interface{}, context map[string]interface{}) map[string]interface{} {
+
 	interpolated := make(map[string]interface{})
 
 	for key, value := range payload {
 		switch v := value.(type) {
-
 		case string:
 			interpolated[key] = interpolateString(v, context)
-
 		case map[string]interface{}:
 			interpolated[key] = interpolatePayload(v, context)
-
 		default:
 			interpolated[key] = v
 		}
@@ -230,20 +352,15 @@ func interpolatePayload(payload map[string]interface{}, context map[string]inter
 	return interpolated
 }
 
-var templateRegex = regexp.MustCompile(`\{\{([^}]+)\}\}`)
-
 func interpolateString(input string, context map[string]interface{}) string {
 
 	matches := templateRegex.FindAllStringSubmatch(input, -1)
-
 	result := input
 
 	for _, match := range matches {
 		fullMatch := match[0]
-		expression := match[1] // e.g. step1.response.data.name
-
+		expression := match[1]
 		value := resolvePath(expression, context)
-
 		if value != "" {
 			result = strings.ReplaceAll(result, fullMatch, value)
 		}
@@ -255,27 +372,20 @@ func interpolateString(input string, context map[string]interface{}) string {
 func resolvePath(path string, context map[string]interface{}) string {
 
 	parts := strings.Split(path, ".")
-
 	if len(parts) < 2 {
 		return ""
 	}
 
 	stepID := parts[0]
-
 	stepDataRaw, ok := context[stepID]
 	if !ok {
 		return ""
 	}
 
-	stepData, ok := stepDataRaw.(map[string]interface{})
-	if !ok {
-		return ""
-	}
-
+	stepData := stepDataRaw.(map[string]interface{})
 	current := stepData
 
 	for _, part := range parts[1:] {
-
 		next, ok := current[part]
 		if !ok {
 			return ""
