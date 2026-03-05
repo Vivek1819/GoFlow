@@ -603,3 +603,29 @@ func stringify(v interface{}) string {
 		return string(bytes)
 	}
 }
+
+
+func CancelWorkflow(workflowID int) error {
+
+	res, err := DB.Exec(`
+		UPDATE workflows
+		SET status = 'cancelled', updated_at = NOW()
+		WHERE id = $1
+		AND status = 'running'
+	`, workflowID)
+
+	if err != nil {
+		return err
+	}
+
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rows == 0 {
+		return fmt.Errorf("workflow is not running or does not exist")
+	}
+
+	return nil
+}

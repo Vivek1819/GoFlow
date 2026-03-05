@@ -620,6 +620,21 @@ func workflowDetailHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 🔴 CANCEL WORKFLOW
+	if len(parts) == 2 && parts[1] == "cancel" && r.Method == http.MethodPost {
+		err := workflow.CancelWorkflow(workflowID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"workflow_id": workflowID,
+			"status":      "cancelled",
+		})
+		return
+	}
+
 	// /workflows/{id}/steps
 	if len(parts) == 2 && parts[1] == "steps" {
 		getWorkflowSteps(w, workflowID)
@@ -747,4 +762,29 @@ func jobDetailHandler(w http.ResponseWriter, r *http.Request) {
 
 	json.Unmarshal(payloadBytes, &job.Payload)
 	json.NewEncoder(w).Encode(job)
+}
+
+func cancelWorkflowHandler(w http.ResponseWriter, r *http.Request) {
+
+	idStr := strings.TrimPrefix(r.URL.Path, "/workflows/")
+	idStr = strings.TrimSuffix(idStr, "/cancel")
+
+	workflowID, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, "invalid workflow id", http.StatusBadRequest)
+		return
+	}
+
+	err = workflow.CancelWorkflow(workflowID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	resp := map[string]interface{}{
+		"workflow_id": workflowID,
+		"status":      "cancelled",
+	}
+
+	json.NewEncoder(w).Encode(resp)
 }
