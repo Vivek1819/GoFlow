@@ -228,6 +228,31 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 			return
 		}
 
+		// Attempt to acquire barrier resume lock
+		res, err := DB.Exec(`
+			UPDATE workflows
+			SET barrier_resumed = TRUE
+			WHERE id = $1
+			AND barrier_resumed = FALSE
+			AND status = 'running'
+		`, workflowID)
+
+		if err != nil {
+			log.Println("Barrier lock acquisition failed:", err)
+			return
+		}
+
+		rows, err := res.RowsAffected()
+		if err != nil {
+			log.Println("Failed reading barrier lock result:", err)
+			return
+		}
+
+		if rows == 0 {
+			// Another worker already resumed workflow
+			return
+		}
+
 		parentIndex := findStepIndexByID(steps, parentStepID)
 		nextIndex := parentIndex + 1
 
@@ -310,6 +335,17 @@ func handleCondition(workflowID int, steps []map[string]interface{}, step map[st
 }
 
 func handleParallel(workflowID int, steps []map[string]interface{}, step map[string]interface{}, context map[string]interface{}) {
+
+	// Reset barrier resume lock
+	_, err := DB.Exec(`
+		UPDATE workflows
+		SET barrier_resumed = FALSE
+		WHERE id = $1
+	`, workflowID)
+
+	if err != nil {
+		log.Println("Failed to reset barrier lock:", err)
+	}
 
 	rawBranches, ok := step["branches"].([]interface{})
 	if !ok || len(rawBranches) == 0 {
