@@ -93,26 +93,44 @@ func Start(payload map[string]interface{}) (int, []byte, error) {
 
 func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte) {
 
-    wfIDRaw, ok := payload["workflow_id"]
-    if !ok {
-        return
-    }
+	wfIDRaw, ok := payload["workflow_id"]
+	if !ok {
+		return
+	}
 
-    workflowID := int(wfIDRaw.(float64))
+	workflowID := int(wfIDRaw.(float64))
 
-    // Get job status
-    var jobStatus string
-    err := DB.QueryRow(`
+	// 🔒 STATE MACHINE GUARD
+	var wfStatus string
+
+	err := DB.QueryRow(`
+    SELECT status
+    FROM workflows
+    WHERE id = $1
+`, workflowID).Scan(&wfStatus)
+
+	if err != nil {
+		log.Println("Failed to fetch workflow status:", err)
+		return
+	}
+
+	if wfStatus == "completed" || wfStatus == "failed" || wfStatus == "cancelled" {
+		return
+	}
+
+	// Get job status
+	var jobStatus string
+	err = DB.QueryRow(`
         SELECT status FROM jobs WHERE id = $1
     `, jobID).Scan(&jobStatus)
 
-    if err != nil {
-        log.Println("Failed to fetch job status:", err)
-        return
-    }
+	if err != nil {
+		log.Println("Failed to fetch job status:", err)
+		return
+	}
 
-    // Update step run
-    _, err = DB.Exec(`
+	// Update step run
+	_, err = DB.Exec(`
         UPDATE workflow_step_runs
         SET status = $1,
             finished_at = NOW(),
@@ -121,72 +139,77 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
         WHERE job_id = $3
     `, jobStatus, response, jobID)
 
-    if err != nil {
-        log.Println("Failed to update workflow_step_run:", err)
-    }
+	if err != nil {
+		log.Println("Failed to update workflow_step_run:", err)
+	}
 
-    if jobStatus == "failed" {
-        DB.Exec(`
+	if jobStatus == "failed" {
+		DB.Exec(`
             UPDATE workflows
-            SET status = 'failed', updated_at = NOW()
-            WHERE id = $1
+			SET status = 'failed', updated_at = NOW()
+			WHERE id = $1
+			AND status = 'running'
         `, workflowID)
-        return
-    }
+		return
+	}
 
-    // Load workflow steps + context
-    var stepsJSON []byte
-    var contextJSON []byte
+	// Load workflow steps + context
+	var stepsJSON []byte
+	var contextJSON []byte
 
-    err = DB.QueryRow(`
+	err = DB.QueryRow(`
         SELECT steps, context FROM workflows WHERE id = $1
     `, workflowID).Scan(&stepsJSON, &contextJSON)
 
-    if err != nil {
-        log.Println("Workflow fetch failed:", err)
-        return
-    }
+	if err != nil {
+		log.Println("Workflow fetch failed:", err)
+		return
+	}
 
-    var steps []map[string]interface{}
-    json.Unmarshal(stepsJSON, &steps)
+	var steps []map[string]interface{}
+	json.Unmarshal(stepsJSON, &steps)
 
-    var contextMap map[string]interface{}
-    if contextJSON == nil {
-        contextMap = make(map[string]interface{})
-    } else {
-        json.Unmarshal(contextJSON, &contextMap)
-    }
+	var contextMap map[string]interface{}
+	if contextJSON == nil {
+		contextMap = make(map[string]interface{})
+	} else {
+		json.Unmarshal(contextJSON, &contextMap)
+	}
 
-    // Store response in context
-    stepID := payload["step_id"].(string)
+	// Store response in context
+	stepIDRaw, ok := payload["step_id"]
+	if !ok {
+		return
+	}
+	stepID := stepIDRaw.(string)
 
-    var parsed interface{}
-    json.Unmarshal(response, &parsed)
+	var parsed interface{}
+	json.Unmarshal(response, &parsed)
 
-    contextMap[stepID] = map[string]interface{}{
-        "response": parsed,
-    }
+	contextMap[stepID] = map[string]interface{}{
+		"response": parsed,
+	}
 
-    newContextJSON, _ := json.Marshal(contextMap)
+	newContextJSON, _ := json.Marshal(contextMap)
 
-    DB.Exec(`
+	DB.Exec(`
         UPDATE workflows
         SET context = $2, updated_at = NOW()
         WHERE id = $1
     `, workflowID, newContextJSON)
 
-    // =========================
-    // PARALLEL CHILD LOGIC
-    // =========================
+	// =========================
+	// PARALLEL CHILD LOGIC
+	// =========================
 
-    if parentIDRaw, exists := payload["parent_parallel_step"]; exists {
+	if parentIDRaw, exists := payload["parent_parallel_step"]; exists {
 
-        parentStepID := parentIDRaw.(string)
+		parentStepID := parentIDRaw.(string)
 
-        var total int
-        var completed int
+		var total int
+		var completed int
 
-        err := DB.QueryRow(`
+		err := DB.QueryRow(`
             SELECT 
                 COUNT(*),
                 COUNT(*) FILTER (WHERE status = 'completed')
@@ -196,61 +219,63 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
               AND is_parallel_child = TRUE
         `, workflowID, parentStepID).Scan(&total, &completed)
 
-        if err != nil {
-            log.Println("Parallel barrier check failed:", err)
-            return
-        }
+		if err != nil {
+			log.Println("Parallel barrier check failed:", err)
+			return
+		}
 
-        if completed < total {
-            return
-        }
+		if completed < total {
+			return
+		}
 
-        parentIndex := findStepIndexByID(steps, parentStepID)
-        nextIndex := parentIndex + 1
+		parentIndex := findStepIndexByID(steps, parentStepID)
+		nextIndex := parentIndex + 1
 
-        if nextIndex >= len(steps) {
-            DB.Exec(`
-                UPDATE workflows
-                SET status = 'completed', updated_at = NOW()
-                WHERE id = $1
-            `, workflowID)
-            return
-        }
+		if nextIndex >= len(steps) {
+			DB.Exec(`
+				UPDATE workflows
+				SET status = 'completed', updated_at = NOW()
+				WHERE id = $1
+				AND status = 'running'
+			`, workflowID)
+			return
+		}
 
-        spawnStep(workflowID, steps, nextIndex, contextMap, false)
-        return
-    }
+		spawnStep(workflowID, steps, nextIndex, contextMap, false)
+		return
+	}
 
-    // =========================
-    // SEQUENTIAL LOGIC
-    // =========================
+	// =========================
+	// SEQUENTIAL LOGIC
+	// =========================
 
-    stepIndex := int(payload["step_index"].(float64))
-    nextIndex := stepIndex + 1
+	stepIndex := int(payload["step_index"].(float64))
+	nextIndex := stepIndex + 1
 
-    if nextIndex >= len(steps) {
-        DB.Exec(`
-            UPDATE workflows
-            SET status = 'completed', updated_at = NOW()
-            WHERE id = $1
-        `, workflowID)
-        return
-    }
+	if nextIndex >= len(steps) {
+		DB.Exec(`
+			UPDATE workflows
+			SET status = 'completed', updated_at = NOW()
+			WHERE id = $1
+			AND status = 'running'
+		`, workflowID)
+		return
+	}
 
-    nextStep := steps[nextIndex]
-    nextType := nextStep["type"].(string)
+	nextStep := steps[nextIndex]
+	nextType := nextStep["type"].(string)
 
-    if nextType == "condition" {
-        handleCondition(workflowID, steps, nextStep, contextMap)
-        return
-    }
+	if nextType == "condition" {
+		handleCondition(workflowID, steps, nextStep, contextMap)
+		return
+	}
 
-    if nextType == "parallel" {
-        handleParallel(workflowID, steps, nextStep, contextMap)
-        return
-    }
+	if nextType == "parallel" {
+		handleParallel(workflowID, steps, nextStep, contextMap)
+		return
+	}
 
-    spawnStep(workflowID, steps, nextIndex, contextMap, false)
+	spawnStep(workflowID, steps, nextIndex, contextMap, false)
 }
 
 // ============================
