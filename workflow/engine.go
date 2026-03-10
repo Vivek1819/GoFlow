@@ -31,8 +31,8 @@ func Start(payload map[string]interface{}) (int, []byte, error) {
 	var workflowID int
 
 	err = DB.QueryRow(`
-		INSERT INTO workflows (status, steps)
-		VALUES ('running', $1)
+		INSERT INTO workflows (status, steps, started_at)
+		VALUES ('running', $1, NOW())
 		RETURNING id
 	`, stepsJSON).Scan(&workflowID)
 
@@ -146,7 +146,10 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 	if jobStatus == "failed" {
 		DB.Exec(`
             UPDATE workflows
-			SET status = 'failed', updated_at = NOW()
+			SET status = 'failed',
+				finished_at = NOW(),
+				execution_time_ms = EXTRACT(EPOCH FROM (NOW() - started_at)) * 1000,
+				updated_at = NOW()
 			WHERE id = $1
 			AND status = 'running'
         `, workflowID)
@@ -259,7 +262,10 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 		if nextIndex >= len(steps) {
 			DB.Exec(`
 				UPDATE workflows
-				SET status = 'completed', updated_at = NOW()
+				SET status = 'completed',
+					finished_at = NOW(),
+					execution_time_ms = EXTRACT(EPOCH FROM (NOW() - started_at)) * 1000,
+					updated_at = NOW()
 				WHERE id = $1
 				AND status = 'running'
 			`, workflowID)
@@ -280,7 +286,10 @@ func AdvanceIfNeeded(jobID int, payload map[string]interface{}, response []byte)
 	if nextIndex >= len(steps) {
 		DB.Exec(`
 			UPDATE workflows
-			SET status = 'completed', updated_at = NOW()
+			SET status = 'completed',
+				finished_at = NOW(),
+				execution_time_ms = EXTRACT(EPOCH FROM (NOW() - started_at)) * 1000,
+				updated_at = NOW()
 			WHERE id = $1
 			AND status = 'running'
 		`, workflowID)
@@ -604,12 +613,14 @@ func stringify(v interface{}) string {
 	}
 }
 
-
 func CancelWorkflow(workflowID int) error {
 
 	res, err := DB.Exec(`
 		UPDATE workflows
-		SET status = 'cancelled', updated_at = NOW()
+		SET status = 'cancelled',
+			finished_at = NOW(),
+			execution_time_ms = EXTRACT(EPOCH FROM (NOW() - started_at)) * 1000,
+			updated_at = NOW()
 		WHERE id = $1
 		AND status = 'running'
 	`, workflowID)

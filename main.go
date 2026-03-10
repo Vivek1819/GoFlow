@@ -38,6 +38,10 @@ type Workflow struct {
 	Context   json.RawMessage `json:"context"`
 	CreatedAt time.Time       `json:"created_at"`
 	UpdatedAt time.Time       `json:"updated_at"`
+
+	StartedAt       *time.Time `json:"started_at"`
+	FinishedAt      *time.Time `json:"finished_at"`
+	ExecutionTimeMs *int64     `json:"execution_time_ms"`
 }
 
 type WorkflowStepRun struct {
@@ -323,35 +327,46 @@ func initDB() {
 	}
 
 	createWorkflowTable := `
-CREATE TABLE IF NOT EXISTS workflows (
-	id SERIAL PRIMARY KEY,
-	status TEXT NOT NULL,
-	current_step INT DEFAULT 0,
-	steps JSONB NOT NULL,
-	context JSONB DEFAULT '{}'::jsonb,
-	created_at TIMESTAMP DEFAULT NOW(),
-	updated_at TIMESTAMP DEFAULT NOW()
-);
-`
+	CREATE TABLE IF NOT EXISTS workflows (
+		id SERIAL PRIMARY KEY,
+		status TEXT NOT NULL,
+		current_step INT DEFAULT 0,
+		steps JSONB NOT NULL,
+		context JSONB DEFAULT '{}'::jsonb,
+
+		started_at TIMESTAMP,
+		finished_at TIMESTAMP,
+		execution_time_ms BIGINT,
+
+		barrier_resumed BOOLEAN DEFAULT FALSE,
+
+		created_at TIMESTAMP DEFAULT NOW(),
+		updated_at TIMESTAMP DEFAULT NOW()
+	);
+	`
 	_, err = db.Exec(createWorkflowTable)
 	if err != nil {
 		log.Fatal("Failed to create workflows table:", err)
 	}
 
 	createWorkflowStepRuns := `
-CREATE TABLE IF NOT EXISTS workflow_step_runs (
-	id SERIAL PRIMARY KEY,
-	workflow_id INT NOT NULL,
-	step_id TEXT NOT NULL,
-	job_id INT NOT NULL,
-	status TEXT NOT NULL,
-	started_at TIMESTAMP DEFAULT NOW(),
-	finished_at TIMESTAMP,
-	error TEXT,
-	response_snapshot JSONB,
-	created_at TIMESTAMP DEFAULT NOW()
-);
-`
+	CREATE TABLE IF NOT EXISTS workflow_step_runs (
+		id SERIAL PRIMARY KEY,
+		workflow_id INT NOT NULL,
+		step_id TEXT NOT NULL,
+		job_id INT NOT NULL,
+		status TEXT NOT NULL,
+
+		parent_step_id TEXT,
+		is_parallel_child BOOLEAN DEFAULT FALSE,
+
+		started_at TIMESTAMP DEFAULT NOW(),
+		finished_at TIMESTAMP,
+		error TEXT,
+		response_snapshot JSONB,
+		created_at TIMESTAMP DEFAULT NOW()
+	);
+	`
 	_, err = db.Exec(createWorkflowStepRuns)
 	if err != nil {
 		log.Fatal("Failed to create workflow_step_runs table:", err)
@@ -576,7 +591,8 @@ func workflowsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rows, err := db.Query(`
-		SELECT id, status, steps, context, created_at, updated_at
+		SELECT id, status, steps, context, created_at, updated_at,
+       	started_at, finished_at, execution_time_ms
 		FROM workflows
 		ORDER BY id DESC
 	`)
@@ -597,6 +613,9 @@ func workflowsHandler(w http.ResponseWriter, r *http.Request) {
 			&wf.Context,
 			&wf.CreatedAt,
 			&wf.UpdatedAt,
+			&wf.StartedAt,
+			&wf.FinishedAt,
+			&wf.ExecutionTimeMs,
 		)
 		if err != nil {
 			http.Error(w, "Scan failed", http.StatusInternalServerError)
@@ -650,7 +669,8 @@ func workflowDetailHandler(w http.ResponseWriter, r *http.Request) {
 	// Default: workflow metadata
 	var wf Workflow
 	err = db.QueryRow(`
-		SELECT id, status, steps, context, created_at, updated_at
+		SELECT id, status, steps, context, created_at, updated_at,
+       	started_at, finished_at, execution_time_ms
 		FROM workflows
 		WHERE id = $1
 	`, workflowID).Scan(
@@ -660,6 +680,9 @@ func workflowDetailHandler(w http.ResponseWriter, r *http.Request) {
 		&wf.Context,
 		&wf.CreatedAt,
 		&wf.UpdatedAt,
+		&wf.StartedAt,
+		&wf.FinishedAt,
+		&wf.ExecutionTimeMs,
 	)
 
 	if err != nil {
@@ -764,27 +787,3 @@ func jobDetailHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(job)
 }
 
-func cancelWorkflowHandler(w http.ResponseWriter, r *http.Request) {
-
-	idStr := strings.TrimPrefix(r.URL.Path, "/workflows/")
-	idStr = strings.TrimSuffix(idStr, "/cancel")
-
-	workflowID, err := strconv.Atoi(idStr)
-	if err != nil {
-		http.Error(w, "invalid workflow id", http.StatusBadRequest)
-		return
-	}
-
-	err = workflow.CancelWorkflow(workflowID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	resp := map[string]interface{}{
-		"workflow_id": workflowID,
-		"status":      "cancelled",
-	}
-
-	json.NewEncoder(w).Encode(resp)
-}
