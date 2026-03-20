@@ -280,6 +280,21 @@ func triggerAutoCallback(jobID int, payload map[string]interface{}) {
 	log.Printf("Auto callback sent for job %d\n", jobID)
 }
 
+func enableCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
 // ==================== DB INIT ====================
 
 func initDB() {
@@ -470,15 +485,18 @@ func main() {
 	go startRecoveryLoop(ctx, wg)
 
 	// Start HTTP server in goroutine
-	server := &http.Server{
-		Addr: ":8080",
-	}
+	mux := http.NewServeMux()
 
-	http.HandleFunc("/health", healthHandler)
-	http.HandleFunc("/jobs", jobsHandler)
-	http.HandleFunc("/workflows", workflowsHandler)
-	http.HandleFunc("/workflows/", workflowDetailHandler)
-	http.HandleFunc("/jobs/", jobDetailHandler)
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/jobs", jobsHandler)
+	mux.HandleFunc("/workflows", workflowsHandler)
+	mux.HandleFunc("/workflows/", workflowDetailHandler)
+	mux.HandleFunc("/jobs/", jobDetailHandler)
+
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: enableCORS(mux),
+	}
 
 	go func() {
 		log.Println("Server running on :8080")
@@ -786,4 +804,3 @@ func jobDetailHandler(w http.ResponseWriter, r *http.Request) {
 	json.Unmarshal(payloadBytes, &job.Payload)
 	json.NewEncoder(w).Encode(job)
 }
-
