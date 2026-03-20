@@ -21,6 +21,17 @@ export default function WorkflowCanvas({ workflowId }: any) {
     const [selectedNode, setSelectedNode] = useState<any>(null);
 
     useEffect(() => {
+        const handleKey = (e: KeyboardEvent) => {
+            if (e.key === "Escape") {
+                setSelectedNode(null);
+            }
+        };
+
+        window.addEventListener("keydown", handleKey);
+        return () => window.removeEventListener("keydown", handleKey);
+    }, []);
+
+    useEffect(() => {
         if (!workflowId) return;
 
         Promise.all([
@@ -68,6 +79,8 @@ export default function WorkflowCanvas({ workflowId }: any) {
                         id: `e-${steps[index - 1].id}-${step.id}`,
                         source: steps[index - 1].id,
                         target: step.id,
+                        animated: true,
+                        style: { stroke: "#64748b", strokeWidth: 1.5 },
                     });
                 }
 
@@ -100,6 +113,8 @@ export default function WorkflowCanvas({ workflowId }: any) {
                             id: `e-${step.id}-${branch.id}`,
                             source: step.id,
                             target: branch.id,
+                            animated: true,
+                            style: { stroke: "#64748b", strokeWidth: 1.5 },
                         });
 
                         if (nextStep) {
@@ -107,6 +122,8 @@ export default function WorkflowCanvas({ workflowId }: any) {
                                 id: `e-${branch.id}-${nextStep.id}`,
                                 source: branch.id,
                                 target: nextStep.id,
+                                animated: true,
+                                style: { stroke: "#64748b", strokeWidth: 1.5 },
                             });
                         }
                     });
@@ -124,7 +141,7 @@ export default function WorkflowCanvas({ workflowId }: any) {
     }, [workflowId]);
 
     return (
-        <div className="flex h-full">
+        <div className="flex h-full relative">
 
             {/* LEFT: Canvas */}
             <div className="flex-1">
@@ -142,8 +159,19 @@ export default function WorkflowCanvas({ workflowId }: any) {
                 </ReactFlow>
             </div>
 
-            {/* RIGHT: Inspector */}
-            <StepInspector node={selectedNode} />
+            {selectedNode && (
+                <div
+                    className="absolute inset-0 z-40"
+                    onClick={() => setSelectedNode(null)}
+                >
+                    <div onClick={(e) => e.stopPropagation()}>
+                        <StepInspector
+                            node={selectedNode}
+                            onClose={() => setSelectedNode(null)}
+                        />
+                    </div>
+                </div>
+            )}
 
         </div>
     );

@@ -1,38 +1,48 @@
-export default function StepInspector({ node }: any) {
-  if (!node) {
-    return (
-      <div className="w-80 bg-zinc-900 border-l border-zinc-800 p-4">
-        <p className="text-zinc-500">Select a step</p>
-      </div>
-    );
-  }
+import { X } from "lucide-react";
+
+export default function StepInspector({ node, onClose }: any) {
+  if (!node) return null;
 
   const { label, type, status, response } = node.data;
 
   return (
-    <div className="w-80 bg-zinc-900 border-l border-zinc-800 p-4 flex flex-col gap-4">
+    <div className="absolute right-6 top-20 w-80 bg-zinc-900/95 backdrop-blur-xl border border-zinc-700 rounded-xl shadow-2xl p-4 z-50">
 
-      <div>
-        <h2 className="text-lg font-semibold text-white">{label}</h2>
-        <p className="text-sm text-zinc-400">{type}</p>
+      {/* Header */}
+      <div className="flex justify-between items-start mb-3">
+
+        <div>
+          <h2 className="text-white font-semibold">{label}</h2>
+          <p className="text-xs text-zinc-400">{type}</p>
+        </div>
+
+        {/* ❌ Close button */}
+        <button
+          onClick={onClose}
+          className="text-zinc-400 hover:text-white transition"
+        >
+          <X size={16} />
+        </button>
       </div>
 
-      <div>
-        <span className="text-xs text-zinc-400">Status</span>
-        <p
-          className={`text-sm font-medium ${
+      {/* Status */}
+      <div className="mb-3">
+        <span
+          className={`text-xs px-2 py-1 rounded ${
             status === "failed"
-              ? "text-red-400"
-              : "text-green-400"
+              ? "bg-red-500/20 text-red-400"
+              : status === "completed"
+              ? "bg-green-500/20 text-green-400"
+              : "bg-yellow-500/20 text-yellow-400"
           }`}
         >
           {status}
-        </p>
+        </span>
       </div>
 
-      <div className="flex-1 overflow-auto">
-        <span className="text-xs text-zinc-400">Response</span>
-        <pre className="text-xs bg-zinc-800 p-2 rounded mt-2 overflow-auto">
+      {/* Response */}
+      <div className="max-h-64 overflow-auto">
+        <pre className="text-xs bg-zinc-800 p-2 rounded">
           {JSON.stringify(response, null, 2)}
         </pre>
       </div>
