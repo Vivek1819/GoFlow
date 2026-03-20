@@ -19,6 +19,7 @@ export default function WorkflowCanvas({ workflowId }: any) {
     const [nodes, setNodes, onNodesChange] = useNodesState([]);
     const [edges, setEdges, onEdgesChange] = useEdgesState([]);
     const [selectedNode, setSelectedNode] = useState<any>(null);
+    const [stepRuns, setStepRuns] = useState<any[]>([]);
 
     useEffect(() => {
         const handleKey = (e: KeyboardEvent) => {
@@ -34,10 +35,13 @@ export default function WorkflowCanvas({ workflowId }: any) {
     useEffect(() => {
         if (!workflowId) return;
 
-        Promise.all([
-            fetchWorkflow(workflowId),
-            fetchWorkflowSteps(workflowId),
-        ]).then(([wf, stepRuns]) => {
+        let interval: any;
+
+        const load = async () => {
+            const wf = await fetchWorkflow(workflowId);
+            const runs = await fetchWorkflowSteps(workflowId);
+
+            setStepRuns(runs);
 
             const steps =
                 typeof wf.steps === "string" ? JSON.parse(wf.steps) : wf.steps;
@@ -46,8 +50,7 @@ export default function WorkflowCanvas({ workflowId }: any) {
 
             // 🔥 Build status map
             const stepStatusMap: Record<string, string> = {};
-
-            stepRuns.forEach((s: any) => {
+            runs.forEach((s: any) => {
                 stepStatusMap[s.step_id] = s.status;
             });
 
@@ -58,9 +61,8 @@ export default function WorkflowCanvas({ workflowId }: any) {
 
             steps.forEach((step: any, index: number) => {
 
-                const status = stepStatusMap[step.id] || "pending";
-
                 const stepContext = wf.context?.[step.id];
+                const status = stepStatusMap[step.id] || "pending";
 
                 newNodes.push({
                     id: step.id,
@@ -79,8 +81,7 @@ export default function WorkflowCanvas({ workflowId }: any) {
                         id: `e-${steps[index - 1].id}-${step.id}`,
                         source: steps[index - 1].id,
                         target: step.id,
-                        animated: true,
-                        style: { stroke: "#64748b", strokeWidth: 1.5 },
+                        animated: status === "running",
                     });
                 }
 
@@ -89,10 +90,8 @@ export default function WorkflowCanvas({ workflowId }: any) {
 
                     step.branches?.forEach((branch: any, i: number) => {
 
-                        const branchStatus =
-                            stepStatusMap[branch.id] || "pending";
-
                         const branchContext = wf.context?.[branch.id];
+                        const branchStatus = stepStatusMap[branch.id] || "pending";
 
                         newNodes.push({
                             id: branch.id,
@@ -113,8 +112,7 @@ export default function WorkflowCanvas({ workflowId }: any) {
                             id: `e-${step.id}-${branch.id}`,
                             source: step.id,
                             target: branch.id,
-                            animated: true,
-                            style: { stroke: "#64748b", strokeWidth: 1.5 },
+                            animated: branchStatus === "running",
                         });
 
                         if (nextStep) {
@@ -122,8 +120,7 @@ export default function WorkflowCanvas({ workflowId }: any) {
                                 id: `e-${branch.id}-${nextStep.id}`,
                                 source: branch.id,
                                 target: nextStep.id,
-                                animated: true,
-                                style: { stroke: "#64748b", strokeWidth: 1.5 },
+                                animated: branchStatus === "running",
                             });
                         }
                     });
@@ -136,7 +133,13 @@ export default function WorkflowCanvas({ workflowId }: any) {
 
             setNodes(newNodes);
             setEdges(newEdges);
-        });
+        };
+
+        load();
+
+        interval = setInterval(load, 1000);
+
+        return () => clearInterval(interval);
 
     }, [workflowId]);
 
