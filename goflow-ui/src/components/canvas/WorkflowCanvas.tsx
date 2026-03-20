@@ -3,27 +3,42 @@ import ReactFlow, {
     Controls,
     type Node,
     type Edge,
+    useNodesState,
+    useEdgesState,
 } from "reactflow";
 import BaseNode from "./nodes/BaseNode";
 import { useEffect, useState } from "react";
-import { fetchWorkflow } from "../../api/workflows";
+import { fetchWorkflow, fetchWorkflowSteps } from "../../api/workflows";
+import StepInspector from "../workflow/StepInspector";
 
 const nodeTypes = {
     base: BaseNode,
 };
 
 export default function WorkflowCanvas({ workflowId }: any) {
-    const [nodes, setNodes] = useState<Node[]>([]);
-    const [edges, setEdges] = useState<Edge[]>([]);
+    const [nodes, setNodes, onNodesChange] = useNodesState([]);
+    const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+    const [selectedNode, setSelectedNode] = useState<any>(null);
 
     useEffect(() => {
         if (!workflowId) return;
 
-        fetchWorkflow(workflowId).then((wf) => {
+        Promise.all([
+            fetchWorkflow(workflowId),
+            fetchWorkflowSteps(workflowId),
+        ]).then(([wf, stepRuns]) => {
+
             const steps =
                 typeof wf.steps === "string" ? JSON.parse(wf.steps) : wf.steps;
 
             if (!steps || !Array.isArray(steps)) return;
+
+            // 🔥 Build status map
+            const stepStatusMap: Record<string, string> = {};
+
+            stepRuns.forEach((s: any) => {
+                stepStatusMap[s.step_id] = s.status;
+            });
 
             let newNodes: Node[] = [];
             let newEdges: Edge[] = [];
@@ -31,7 +46,11 @@ export default function WorkflowCanvas({ workflowId }: any) {
             let x = 100;
 
             steps.forEach((step: any, index: number) => {
-                // ✅ Create main step node
+
+                const status = stepStatusMap[step.id] || "pending";
+
+                const stepContext = wf.context?.[step.id];
+
                 newNodes.push({
                     id: step.id,
                     type: "base",
@@ -39,11 +58,11 @@ export default function WorkflowCanvas({ workflowId }: any) {
                     data: {
                         label: step.id,
                         type: step.type,
-                        status: wf.status === "failed" ? "failed" : "completed",
+                        status,
+                        response: stepContext?.response || null,
                     },
                 });
 
-                // ✅ Connect previous → current
                 if (index > 0 && steps[index - 1].type !== "parallel") {
                     newEdges.push({
                         id: `e-${steps[index - 1].id}-${step.id}`,
@@ -52,12 +71,16 @@ export default function WorkflowCanvas({ workflowId }: any) {
                     });
                 }
 
-                // ✅ PARALLEL handling (fan-out + fan-in)
                 if (step.type === "parallel") {
                     const nextStep = steps[index + 1];
 
                     step.branches?.forEach((branch: any, i: number) => {
-                        // create branch node
+
+                        const branchStatus =
+                            stepStatusMap[branch.id] || "pending";
+
+                        const branchContext = wf.context?.[branch.id];
+
                         newNodes.push({
                             id: branch.id,
                             type: "base",
@@ -68,20 +91,17 @@ export default function WorkflowCanvas({ workflowId }: any) {
                             data: {
                                 label: branch.id,
                                 type: branch.type,
-                                status: branch.id.includes("fail")
-                                    ? "failed"
-                                    : "completed",
+                                status: branchStatus,
+                                response: branchContext?.response || null,
                             },
                         });
 
-                        // fan-out: parallel → branch
                         newEdges.push({
                             id: `e-${step.id}-${branch.id}`,
                             source: step.id,
                             target: branch.id,
                         });
 
-                        // 🔥 fan-in: branch → next step
                         if (nextStep) {
                             newEdges.push({
                                 id: `e-${branch.id}-${nextStep.id}`,
@@ -100,19 +120,31 @@ export default function WorkflowCanvas({ workflowId }: any) {
             setNodes(newNodes);
             setEdges(newEdges);
         });
+
     }, [workflowId]);
 
     return (
-        <div className="flex-1 h-full">
-            <ReactFlow
-                nodes={nodes}
-                edges={edges}
-                nodeTypes={nodeTypes}
-                fitView
-            >
-                <Background color="#1a1a1a" gap={24} />
-                <Controls />
-            </ReactFlow>
+        <div className="flex h-full">
+
+            {/* LEFT: Canvas */}
+            <div className="flex-1">
+                <ReactFlow
+                    nodes={nodes}
+                    edges={edges}
+                    nodeTypes={nodeTypes}
+                    onNodesChange={onNodesChange}
+                    onEdgesChange={onEdgesChange}
+                    onNodeClick={(_, node) => setSelectedNode(node)}
+                    fitView
+                >
+                    <Background color="#1a1a1a" gap={24} />
+                    <Controls />
+                </ReactFlow>
+            </div>
+
+            {/* RIGHT: Inspector */}
+            <StepInspector node={selectedNode} />
+
         </div>
     );
 }
