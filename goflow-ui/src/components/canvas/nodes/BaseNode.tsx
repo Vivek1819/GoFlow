@@ -5,7 +5,7 @@ type Props = {
   data: {
     label: string;
     type: string;
-    status?: "idle" | "running" | "completed" | "failed";
+    status?: "idle" | "running" | "completed" | "failed" | "cancelled";
   };
 };
 
@@ -19,7 +19,19 @@ export default function BaseNode({ data }: Props) {
       case "failed":
         return "border-red-500/40 bg-red-500/5 shadow-red-500/10";
       case "running":
-        return "border-yellow-400/50 bg-yellow-400/5 animate-pulse shadow-yellow-400/20";
+        return `
+          border-yellow-400
+          bg-yellow-400/10
+          shadow-[0_0_20px_rgba(250,204,21,0.6)]
+          animate-pulse
+        `;
+      case "cancelled":
+        return `
+        border-zinc-500/40
+        bg-zinc-500/5
+        shadow-none
+        opacity-70
+      `;
       default:
         return "border-zinc-700 bg-[#111114]";
     }
@@ -34,6 +46,8 @@ export default function BaseNode({ data }: Props) {
         return <CheckCircle size={14} className="text-green-400" />;
       case "failed":
         return <XCircle size={14} className="text-red-400" />;
+      case "cancelled":
+        return <XCircle size={14} className="text-zinc-400" />;
       default:
         return null;
     }
@@ -71,6 +85,13 @@ export default function BaseNode({ data }: Props) {
       {/* Subtle glow effect (only for running) */}
       {data.status === "running" && (
         <div className="absolute inset-0 rounded-xl border border-yellow-400/20 animate-ping pointer-events-none" />
+      )}
+
+      {/* Cancelled */}
+      {data.status === "cancelled" && (
+        <div className="text-[10px] text-zinc-400 mt-1">
+          Cancelled
+        </div>
       )}
 
       {/* Handles */}

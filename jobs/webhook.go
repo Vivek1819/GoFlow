@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"bytes"
+	"context" // ✅ ADD
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,7 +13,12 @@ import (
 	"time"
 )
 
-func executeWebhookDelivery(payload map[string]interface{}) (int, []byte, error) {
+func executeWebhookDelivery(ctx context.Context, payload map[string]interface{}) (int, []byte, error) {
+
+	// 🔴 EARLY CANCEL CHECK
+	if ctx.Err() == context.Canceled {
+		return 0, nil, fmt.Errorf("webhook cancelled")
+	}
 
 	url, ok := payload["url"].(string)
 	if !ok {
@@ -45,9 +51,12 @@ func executeWebhookDelivery(payload map[string]interface{}) (int, []byte, error)
 	mac.Write(bodyBytes)
 	signature := hex.EncodeToString(mac.Sum(nil))
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(bodyBytes))
+	// ✅ CONTEXT-AWARE REQUEST
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -57,6 +66,12 @@ func executeWebhookDelivery(payload map[string]interface{}) (int, []byte, error)
 
 	resp, err := client.Do(req)
 	if err != nil {
+
+		// 🔥 HANDLE CANCEL
+		if ctx.Err() == context.Canceled {
+			return 0, nil, fmt.Errorf("webhook cancelled")
+		}
+
 		return 0, nil, err
 	}
 	defer resp.Body.Close()

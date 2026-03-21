@@ -1,11 +1,17 @@
 package jobs
 
 import (
+	"context" // ✅ ADD
 	"encoding/json"
 	"fmt"
 )
 
-func executeDBQuery(payload map[string]interface{}) (int, []byte, error) {
+func executeDBQuery(ctx context.Context, payload map[string]interface{}) (int, []byte, error) {
+
+	// 🔴 EARLY CANCEL CHECK
+	if ctx.Err() == context.Canceled {
+		return 0, nil, fmt.Errorf("db query cancelled")
+	}
 
 	query, ok := payload["query"].(string)
 	if !ok || query == "" {
@@ -22,11 +28,19 @@ func executeDBQuery(payload map[string]interface{}) (int, []byte, error) {
 		returnRows = rr
 	}
 
-	// If returning rows
+	// =========================
+	// 🔥 QUERY WITH ROWS
+	// =========================
 	if returnRows {
 
-		rows, err := DB.Query(query, args...)
+		// ✅ CONTEXT-AWARE QUERY
+		rows, err := DB.QueryContext(ctx, query, args...)
 		if err != nil {
+
+			if ctx.Err() == context.Canceled {
+				return 0, nil, fmt.Errorf("db query cancelled")
+			}
+
 			return 0, nil, err
 		}
 		defer rows.Close()
@@ -39,6 +53,11 @@ func executeDBQuery(payload map[string]interface{}) (int, []byte, error) {
 		var results []map[string]interface{}
 
 		for rows.Next() {
+
+			// 🔴 CANCEL CHECK DURING ITERATION
+			if ctx.Err() == context.Canceled {
+				return 0, nil, fmt.Errorf("db iteration cancelled")
+			}
 
 			values := make([]interface{}, len(columns))
 			valuePtrs := make([]interface{}, len(columns))
@@ -55,7 +74,6 @@ func executeDBQuery(payload map[string]interface{}) (int, []byte, error) {
 			for i, col := range columns {
 				val := values[i]
 
-				// Convert []byte to string
 				if b, ok := val.([]byte); ok {
 					rowMap[col] = string(b)
 				} else {
@@ -70,9 +88,17 @@ func executeDBQuery(payload map[string]interface{}) (int, []byte, error) {
 		return 200, jsonBytes, nil
 	}
 
-	// Otherwise just Exec
-	result, err := DB.Exec(query, args...)
+	// =========================
+	// 🔥 EXEC (NO ROWS)
+	// =========================
+
+	result, err := DB.ExecContext(ctx, query, args...)
 	if err != nil {
+
+		if ctx.Err() == context.Canceled {
+			return 0, nil, fmt.Errorf("db exec cancelled")
+		}
+
 		return 0, nil, err
 	}
 

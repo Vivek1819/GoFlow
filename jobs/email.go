@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context" // ✅ ADD
 	"fmt"
 	"net/smtp"
 	"os"
@@ -13,7 +14,12 @@ var (
 	smtpPass = os.Getenv("SMTP_PASS")
 )
 
-func executeSendEmail(payload map[string]interface{}) (int, []byte, error) {
+func executeSendEmail(ctx context.Context, payload map[string]interface{}) (int, []byte, error) {
+
+	// 🔴 EARLY CANCEL CHECK
+	if ctx.Err() == context.Canceled {
+		return 0, nil, fmt.Errorf("email cancelled")
+	}
 
 	to, ok := payload["to"].(string)
 	if !ok {
@@ -40,16 +46,30 @@ func executeSendEmail(payload map[string]interface{}) (int, []byte, error) {
 
 	auth := smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
 
-	err := smtp.SendMail(
-		smtpHost+":"+smtpPort,
-		auth,
-		smtpUser,
-		[]string{to},
-		message,
-	)
+	errChan := make(chan error, 1)
 
-	if err != nil {
-		return 500, nil, err
+	// 🔥 RUN EMAIL IN GOROUTINE
+	go func() {
+		err := smtp.SendMail(
+			smtpHost+":"+smtpPort,
+			auth,
+			smtpUser,
+			[]string{to},
+			message,
+		)
+		errChan <- err
+	}()
+
+	// 🔥 RACE: CANCEL vs SEND
+	select {
+
+	case <-ctx.Done():
+		return 0, nil, fmt.Errorf("email cancelled")
+
+	case err := <-errChan:
+		if err != nil {
+			return 500, nil, err
+		}
 	}
 
 	return 200, []byte(`{"message":"email sent"}`), nil

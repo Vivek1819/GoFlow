@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -16,7 +17,7 @@ var DB *sql.DB
 // Start Workflow
 // ============================
 
-func Start(payload map[string]interface{}) (int, []byte, error) {
+func Start(ctx context.Context, payload map[string]interface{}) (int, []byte, error) {
 
 	rawSteps, ok := payload["steps"].([]interface{})
 	if !ok || len(rawSteps) == 0 {
@@ -625,6 +626,14 @@ func CancelWorkflow(workflowID int) error {
 		AND status = 'running'
 	`, workflowID)
 
+	_, err = DB.Exec(`
+    UPDATE workflow_step_runs
+    SET status = 'cancelled',
+        finished_at = NOW()
+    WHERE workflow_id = $1
+    AND status = 'running'
+`, workflowID)
+
 	if err != nil {
 		return err
 	}
@@ -637,6 +646,74 @@ func CancelWorkflow(workflowID int) error {
 	if rows == 0 {
 		return fmt.Errorf("workflow is not running or does not exist")
 	}
+
+	return nil
+}
+
+func RunWorkflow(workflowID int) error {
+
+	var currentStatus string
+	err := DB.QueryRow(`
+	SELECT status FROM workflows WHERE id = $1
+`, workflowID).Scan(&currentStatus)
+
+	if err != nil {
+		return err
+	}
+
+	if currentStatus == "running" {
+		return fmt.Errorf("workflow already running")
+	}
+
+	// 1. Reset workflow
+	_, err = DB.Exec(`
+		UPDATE workflows
+		SET status = 'running',
+			started_at = NOW(),
+			finished_at = NULL,
+			execution_time_ms = NULL,
+			context = '{}'::jsonb,
+			barrier_resumed = FALSE,
+			updated_at = NOW()
+		WHERE id = $1
+	`, workflowID)
+
+	if err != nil {
+		return err
+	}
+
+	// 2. Delete old step runs
+	_, err = DB.Exec(`
+		DELETE FROM workflow_step_runs
+		WHERE workflow_id = $1
+	`, workflowID)
+
+	if err != nil {
+		return err
+	}
+
+	// 3. Fetch steps
+	var stepsJSON []byte
+
+	err = DB.QueryRow(`
+		SELECT steps FROM workflows WHERE id = $1
+	`, workflowID).Scan(&stepsJSON)
+
+	if err != nil {
+		return err
+	}
+
+	var steps []map[string]interface{}
+	json.Unmarshal(stepsJSON, &steps)
+
+	if len(steps) == 0 {
+		return fmt.Errorf("no steps found")
+	}
+
+	// 4. Spawn first step (CRITICAL)
+	spawnStep(workflowID, steps, 0, map[string]interface{}{}, false)
+
+	log.Println("Workflow RUN triggered:", workflowID)
 
 	return nil
 }

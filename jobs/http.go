@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"bytes"
+	"context"   // ✅ ADD THIS
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,7 +10,7 @@ import (
 	"time"
 )
 
-func executeHTTPRequest(payload map[string]interface{}) (int, []byte, error) {
+func executeHTTPRequest(ctx context.Context, payload map[string]interface{}) (int, []byte, error) {
 
 	url, ok := payload["url"].(string)
 	if !ok {
@@ -30,9 +31,12 @@ func executeHTTPRequest(payload map[string]interface{}) (int, []byte, error) {
 		}
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout: 10 * time.Second, // keep timeout as fallback
+	}
 
-	req, err := http.NewRequest(method, url, bytes.NewBuffer(bodyBytes))
+	// ✅ CRITICAL CHANGE — CONTEXT-AWARE REQUEST
+	req, err := http.NewRequestWithContext(ctx, method, url, bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -41,6 +45,12 @@ func executeHTTPRequest(payload map[string]interface{}) (int, []byte, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
+
+		// 🔥 HANDLE CANCELLATION CLEANLY
+		if ctx.Err() == context.Canceled {
+			return 0, nil, fmt.Errorf("request cancelled")
+		}
+
 		return 0, nil, err
 	}
 	defer resp.Body.Close()

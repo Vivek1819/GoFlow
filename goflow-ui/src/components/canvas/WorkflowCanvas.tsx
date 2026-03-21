@@ -10,6 +10,8 @@ import BaseNode from "./nodes/BaseNode";
 import { useEffect, useState } from "react";
 import { fetchWorkflow, fetchWorkflowSteps } from "../../api/workflows";
 import StepInspector from "../workflow/StepInspector";
+import { runWorkflow } from "../../api/workflows";
+import { cancelWorkflow } from "../../api/workflows";
 
 const nodeTypes = {
     base: BaseNode,
@@ -20,6 +22,8 @@ export default function WorkflowCanvas({ workflowId }: any) {
     const [edges, setEdges, onEdgesChange] = useEdgesState([]);
     const [selectedNode, setSelectedNode] = useState<any>(null);
     const [stepRuns, setStepRuns] = useState<any[]>([]);
+    const [isRunning, setIsRunning] = useState(false);
+    const [isCancelling, setIsCancelling] = useState(false);
 
     useEffect(() => {
         const handleKey = (e: KeyboardEvent) => {
@@ -82,6 +86,18 @@ export default function WorkflowCanvas({ workflowId }: any) {
                         source: steps[index - 1].id,
                         target: step.id,
                         animated: status === "running",
+                        style: {
+                            stroke:
+                                status === "running"
+                                    ? "#facc15"
+                                    : status === "completed"
+                                        ? "#22c55e"
+                                        : status === "failed"
+                                            ? "#ef4444"
+                                            : status === "cancelled"
+                                                ? "#94a3b8" // gray
+                                                : "#64748b",
+                        }
                     });
                 }
 
@@ -147,7 +163,102 @@ export default function WorkflowCanvas({ workflowId }: any) {
         <div className="flex h-full relative">
 
             {/* LEFT: Canvas */}
-            <div className="flex-1">
+            <div className="flex-1 relative">
+                <div className="absolute top-4 right-4 z-10 flex gap-2">
+
+                    <button
+                        onClick={async () => {
+                            if (!workflowId || isRunning) return;
+
+                            try {
+                                setIsRunning(true);
+
+                                await runWorkflow(workflowId);
+
+                                // 🔥 force immediate refresh instead of waiting 1s
+                                const wf = await fetchWorkflow(workflowId);
+                                const runs = await fetchWorkflowSteps(workflowId);
+                                setStepRuns(runs);
+
+                            } catch (err) {
+                                console.error("Run failed:", err);
+                            } finally {
+                                setIsRunning(false);
+                            }
+                        }}
+                        className={`
+                            group relative flex items-center gap-2
+                            px-5 py-2.5
+                            text-sm font-medium
+                            rounded-xl
+                            backdrop-blur-xl
+                            transition-all duration-300
+
+                            ${isRunning
+                                ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/40 cursor-not-allowed"
+                                : "text-gray-200 bg-[#111114]/80 border-white/10 hover:bg-[#1a1a1f] hover:border-emerald-500/50 hover:shadow-[0_0_20px_rgba(16,185,129,0.2)] hover:-translate-y-0.5"}
+                    `}
+                    >
+                        {/* Glow effect on hover */}
+                        <div className="absolute inset-0 bg-gradient-to-r from-emerald-500/10 to-teal-500/10 opacity-0 group-hover:opacity-100 transition-opacity duration-300" />
+
+                        <svg
+                            className="w-4 h-4 text-emerald-500 fill-current group-hover:text-emerald-400 group-hover:scale-110 drop-shadow-[0_0_8px_rgba(16,185,129,0.5)] transition-all duration-300 relative z-10"
+                            viewBox="0 0 24 24"
+                        >
+                            <path d="M8 5v14l11-7z" />
+                        </svg>
+                        <span className="relative z-10 group-hover:text-white transition-colors duration-300">{isRunning ? "Running..." : "Run Workflow"}</span>
+                    </button>
+
+                    <button
+                        onClick={async () => {
+                            if (!workflowId || isCancelling) return;
+
+                            try {
+                                setIsCancelling(true);
+
+                                await cancelWorkflow(workflowId);
+
+                            } catch (err) {
+                                console.error("Cancel failed:", err);
+                            } finally {
+                                setIsCancelling(false);
+                            }
+                        }}
+                        disabled={isCancelling}
+                        className={`
+                            group relative flex items-center gap-2
+                            px-5 py-2.5
+                            text-sm font-medium
+                            rounded-xl
+                            backdrop-blur-xl
+                            transition-all duration-300
+
+                            ${isCancelling
+                                ? "bg-red-500/20 text-red-300 border-red-500/40 cursor-not-allowed"
+                                : "text-gray-200 bg-[#111114]/80 border border-white/10 hover:bg-[#1a1a1f] hover:border-red-500/50 hover:shadow-[0_0_20px_rgba(239,68,68,0.2)] hover:-translate-y-0.5"}
+                        `}
+                    >
+                        {/* Icon */}
+                        {isCancelling ? (
+                            <div className="w-4 h-4 border-2 border-red-400 border-t-transparent rounded-full animate-spin" />
+                        ) : (
+                            <svg
+                                className="w-4 h-4 text-red-500 group-hover:text-red-400 transition-all duration-300"
+                                viewBox="0 0 24 24"
+                                fill="currentColor"
+                            >
+                                <path d="M6 6h12v12H6z" />
+                            </svg>
+                        )}
+
+                        <span>
+                            {isCancelling ? "Cancelling..." : "Cancel"}
+                        </span>
+                    </button>
+
+                </div>
                 <ReactFlow
                     nodes={nodes}
                     edges={edges}

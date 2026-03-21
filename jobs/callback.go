@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"bytes"
+	"context"   // ✅ ADD
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,7 +13,7 @@ import (
 	"time"
 )
 
-func executeCallback(payload map[string]interface{}) (int, []byte, error) {
+func executeCallback(ctx context.Context, payload map[string]interface{}) (int, []byte, error) {
 
 	url, ok := payload["url"].(string)
 	if !ok || url == "" {
@@ -69,7 +70,8 @@ func executeCallback(payload map[string]interface{}) (int, []byte, error) {
 		return 0, nil, err
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer(bodyBytes))
+	// ✅ CONTEXT-AWARE REQUEST
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -90,6 +92,12 @@ func executeCallback(payload map[string]interface{}) (int, []byte, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
+
+		// 🔥 HANDLE CANCEL
+		if ctx.Err() == context.Canceled {
+			return 0, nil, fmt.Errorf("callback cancelled")
+		}
+
 		return 0, nil, err
 	}
 	defer resp.Body.Close()

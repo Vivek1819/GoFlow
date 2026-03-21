@@ -138,6 +138,7 @@ func startWorker(ctx context.Context, wg *sync.WaitGroup, workerID int) {
 }
 
 func processJob(workerID int, id int) {
+
 	var job Job
 	var payloadBytes []byte
 
@@ -158,11 +159,58 @@ func processJob(workerID int, id int) {
 		return
 	}
 
+	var workflowID float64
+	if wfID, ok := job.Payload["workflow_id"]; ok {
+		wfIDFloat, ok := wfID.(float64)
+		if !ok {
+			log.Println("Invalid workflow_id type")
+			return
+		}
+		workflowID = wfIDFloat
+
+		var status string
+		err := db.QueryRow(`
+        SELECT status FROM workflows WHERE id = $1
+    `, int(workflowID)).Scan(&status)
+
+		if err == nil && status == "cancelled" {
+			log.Printf("[Worker %d] Skipping job %d (workflow cancelled)\n", workerID, job.ID)
+
+			db.Exec(`
+            UPDATE jobs
+			SET status = 'cancelled',
+				last_error = 'workflow cancelled',
+				updated_at = NOW()
+			WHERE id = $1
+		`, job.ID)
+
+			return
+		}
+	}
+
 	log.Printf("[Worker %d] Executing job %d\n", workerID, job.ID)
 
 	start := time.Now()
 
-	statusCode, responseBody, execErr := jobs.Execute(job.Type, job.Payload)
+	ctx := context.Background()
+
+	// 🔴 DOUBLE CHECK BEFORE EXECUTION
+	if wfID, ok := job.Payload["workflow_id"]; ok {
+		wfIDFloat, ok := wfID.(float64)
+		if ok {
+			var status string
+			err := db.QueryRow(`
+			SELECT status FROM workflows WHERE id = $1
+		`, int(wfIDFloat)).Scan(&status)
+
+			if err == nil && status == "cancelled" {
+				log.Printf("[Worker %d] Skipping job %d before execution (cancelled)\n", workerID, job.ID)
+				return
+			}
+		}
+	}
+
+	statusCode, responseBody, execErr := jobs.Execute(ctx, job.Type, job.Payload)
 	// Ensure responseBody is valid JSON
 	var jsonCheck interface{}
 	if len(responseBody) > 0 && json.Unmarshal(responseBody, &jsonCheck) != nil {
@@ -391,6 +439,22 @@ func initDB() {
 }
 
 func handleRetry(workerID int, job Job, execErr error) {
+
+	// DO NOT retry cancelled workflows
+	if wfID, ok := job.Payload["workflow_id"]; ok {
+		wfIDFloat, ok := wfID.(float64)
+		if ok {
+			var status string
+			err := db.QueryRow(`
+			SELECT status FROM workflows WHERE id = $1
+		`, int(wfIDFloat)).Scan(&status)
+
+			if err == nil && status == "cancelled" {
+				log.Println("Skipping retry - workflow cancelled")
+				return
+			}
+		}
+	}
 	log.Println("Execution failed:", execErr)
 
 	var retryCount int
@@ -672,6 +736,23 @@ func workflowDetailHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 🟢 RUN WORKFLOW
+	if len(parts) == 2 && parts[1] == "run" && r.Method == http.MethodPost {
+
+		err := workflow.RunWorkflow(workflowID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"workflow_id": workflowID,
+			"status":      "started",
+		})
+
+		return
+	}
+
 	// /workflows/{id}/steps
 	if len(parts) == 2 && parts[1] == "steps" {
 		getWorkflowSteps(w, workflowID)
@@ -731,6 +812,7 @@ func getWorkflowSteps(w http.ResponseWriter, workflowID int) {
 
 	for rows.Next() {
 		var s WorkflowStepRun
+		var rawResp []byte
 		err := rows.Scan(
 			&s.ID,
 			&s.WorkflowID,
@@ -740,11 +822,15 @@ func getWorkflowSteps(w http.ResponseWriter, workflowID int) {
 			&s.StartedAt,
 			&s.FinishedAt,
 			&s.Error,
-			&s.ResponseSnapshot,
+			&rawResp,
 		)
 		if err != nil {
-			http.Error(w, "Scan failed", http.StatusInternalServerError)
+			log.Println("getWorkflowSteps scan error:", err)
+			http.Error(w, "Scan failed: "+err.Error(), http.StatusInternalServerError)
 			return
+		}
+		if rawResp != nil {
+			s.ResponseSnapshot = rawResp
 		}
 		steps = append(steps, s)
 	}

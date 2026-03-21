@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context" // ✅ ADD
 	"encoding/json"
 	"fmt"
 	"time"
@@ -8,7 +9,12 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
-func executeCronSchedule(payload map[string]interface{}) (int, []byte, error) {
+func executeCronSchedule(ctx context.Context, payload map[string]interface{}) (int, []byte, error) {
+
+	// 🔴 CANCEL CHECK (EARLY EXIT)
+	if ctx.Err() == context.Canceled {
+		return 0, nil, fmt.Errorf("cron cancelled")
+	}
 
 	cronExpr, ok := payload["cron"].(string)
 	if !ok {
@@ -30,6 +36,21 @@ func executeCronSchedule(payload map[string]interface{}) (int, []byte, error) {
 		return 0, nil, fmt.Errorf("job missing payload")
 	}
 
+	// 🔴 CHECK WORKFLOW STATUS (CRITICAL)
+	if wfIDRaw, exists := payload["workflow_id"]; exists {
+
+		workflowID := int(wfIDRaw.(float64))
+
+		var status string
+		err := DB.QueryRow(`
+			SELECT status FROM workflows WHERE id = $1
+		`, workflowID).Scan(&status)
+
+		if err == nil && status == "cancelled" {
+			return 0, nil, fmt.Errorf("workflow cancelled")
+		}
+	}
+
 	parser := cron.NewParser(
 		cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow,
 	)
@@ -47,6 +68,7 @@ func executeCronSchedule(payload map[string]interface{}) (int, []byte, error) {
 		return 0, nil, err
 	}
 
+	// 🟢 Schedule actual job
 	_, err = DB.Exec(`
 		INSERT INTO jobs (type, payload, status, run_at)
 		VALUES ($1, $2, 'pending', $3)
@@ -56,15 +78,19 @@ func executeCronSchedule(payload map[string]interface{}) (int, []byte, error) {
 		return 0, nil, err
 	}
 
-	fullPayloadJSON, _ := json.Marshal(payload)
+	// 🔴 RECURSIVE CRON — ONLY IF NOT CANCELLED
+	if ctx.Err() != context.Canceled {
 
-	_, err = DB.Exec(`
-		INSERT INTO jobs (type, payload, status, run_at)
-		VALUES ('cron_schedule', $1, 'pending', $2)
-	`, fullPayloadJSON, nextRun)
+		fullPayloadJSON, _ := json.Marshal(payload)
 
-	if err != nil {
-		return 0, nil, err
+		_, err = DB.Exec(`
+			INSERT INTO jobs (type, payload, status, run_at)
+			VALUES ('cron_schedule', $1, 'pending', $2)
+		`, fullPayloadJSON, nextRun)
+
+		if err != nil {
+			return 0, nil, err
+		}
 	}
 
 	result := map[string]interface{}{

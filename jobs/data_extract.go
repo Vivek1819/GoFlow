@@ -1,14 +1,19 @@
 package jobs
 
 import (
+	"context" 
 	"fmt"
 	"net/http"
 	"time"
-
 	"github.com/PuerkitoBio/goquery"
 )
 
-func executeDataExtract(payload map[string]interface{}) (int, []byte, error) {
+func executeDataExtract(ctx context.Context, payload map[string]interface{}) (int, []byte, error) {
+
+	// 🔴 EARLY CANCEL CHECK
+	if ctx.Err() == context.Canceled {
+		return 0, nil, fmt.Errorf("data extract cancelled")
+	}
 
 	url, ok := payload["url"].(string)
 	if !ok || url == "" {
@@ -35,11 +40,23 @@ func executeDataExtract(payload map[string]interface{}) (int, []byte, error) {
 	}
 
 	client := &http.Client{
-		Timeout: 8 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 
-	resp, err := client.Get(url)
+	// ✅ CONTEXT-AWARE REQUEST
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
+		return 0, nil, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+
+		// 🔥 HANDLE CANCEL
+		if ctx.Err() == context.Canceled {
+			return 0, nil, fmt.Errorf("request cancelled")
+		}
+
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
@@ -56,7 +73,12 @@ func executeDataExtract(payload map[string]interface{}) (int, []byte, error) {
 
 	var results []string
 
+	// ✅ CANCEL-AWARE ITERATION
 	doc.Find(selector).Each(func(i int, s *goquery.Selection) {
+
+		if ctx.Err() == context.Canceled {
+			return // stop processing further
+		}
 
 		switch extractType {
 

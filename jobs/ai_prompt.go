@@ -7,9 +7,10 @@ import (
 	"io"
 	"net/http"
 	"time"
+	"context"
 )
 
-func executeAIPrompt(payload map[string]interface{}) (int, []byte, error) {
+func executeAIPrompt(ctx context.Context, payload map[string]interface{}) (int, []byte, error) {
 
 	provider, ok := payload["provider"].(string)
 	if !ok || provider == "" {

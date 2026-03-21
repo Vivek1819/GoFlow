@@ -5,42 +5,43 @@ import (
 	"encoding/json"
 	"fmt"
 	"goflow/workflow"
+	"context"
 )
 
 var DB *sql.DB
 
-func Execute(jobType string, payload map[string]interface{}) (int, []byte, error) {
+func Execute(ctx context.Context, jobType string, payload map[string]interface{}) (int, []byte, error) {
 	switch jobType {
 
 	case "http_request":
-		return executeHTTPRequest(payload)
+		return executeHTTPRequest(ctx, payload)
 
 	case "send_email":
-		return executeSendEmail(payload)
+		return executeSendEmail(ctx, payload)
 
 	case "webhook_delivery":
-		return executeWebhookDelivery(payload)
+		return executeWebhookDelivery(ctx, payload)
 
 	case "delay":
-		return executeDelay(payload)
+		return executeDelay(ctx,payload)
 
 	case "cron_schedule":
-		return executeCronSchedule(payload)
+		return executeCronSchedule(ctx, payload)
 
 	case "data_extract":
-		return executeDataExtract(payload)
+		return executeDataExtract(ctx, payload)
 
 	case "ai_prompt":
-		return executeAIPrompt(payload)
+		return executeAIPrompt(ctx, payload)
 
 	case "db_query":
-		return executeDBQuery(payload)
+		return executeDBQuery(ctx, payload)
 
 	case "callback":
-		return executeCallback(payload)
+		return executeCallback(ctx, payload)
 
 	case "workflow":
-		return workflow.Start(payload)
+		return workflow.Start(ctx, payload)
 
 	default:
 		return 0, nil, fmt.Errorf("unknown job type: %s", jobType)
